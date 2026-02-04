@@ -362,6 +362,11 @@ type GeocodeOptions struct {
 	FuzzyDistance int  // Max edit distance for typo tolerance (0 = disabled, 1-2 recommended)
 }
 
+// maxGeocodeInputLen limits input string length to prevent algorithmic complexity
+// attacks on Levenshtein distance calculations. 256 chars accommodates the longest
+// real-world city names while preventing DoS via excessively long inputs.
+const maxGeocodeInputLen = 256
+
 // r represents an index range for city searches.
 type r struct {
 	f int
@@ -788,6 +793,12 @@ func (g *GeoBed) Geocode(n string, opts ...GeocodeOptions) GeobedCity {
 	n = strings.TrimSpace(n)
 	if n == "" {
 		return c
+	}
+
+	// Truncate excessively long inputs to prevent algorithmic complexity attacks
+	// on Levenshtein distance calculations. Use runes to avoid breaking UTF-8.
+	if runes := []rune(n); len(runes) > maxGeocodeInputLen {
+		n = string(runes[:maxGeocodeInputLen])
 	}
 
 	options := GeocodeOptions{}
@@ -1395,23 +1406,24 @@ func openOptionallyCachedFile(file string) (fs.File, error) {
 	return cacheData.Open(file)
 }
 
-func openOptionallyBzippedFile(file string) (io.Reader, error) {
+func openOptionallyBzippedFile(file string) (io.Reader, func() error, error) {
 	fh, err := openOptionallyCachedFile(file + ".bz2")
 	if err != nil {
 		fh, err = openOptionallyCachedFile(file)
 		if err != nil {
-			return nil, fmt.Errorf("opening %s: %w", file, err)
+			return nil, nil, fmt.Errorf("opening %s: %w", file, err)
 		}
-		return fh, nil
+		return fh, fh.Close, nil
 	}
-	return bzip2.NewReader(fh), nil
+	return bzip2.NewReader(fh), fh.Close, nil
 }
 
 func loadGeobedCityData() ([]GeobedCity, error) {
-	fh, err := openOptionallyBzippedFile("geobed-cache/g.c.dmp")
+	fh, cleanup, err := openOptionallyBzippedFile("geobed-cache/g.c.dmp")
 	if err != nil {
 		return nil, err
 	}
+	defer cleanup()
 
 	// Try loading as new format first
 	var gobCities []geobedCityGob
@@ -1437,10 +1449,12 @@ func loadGeobedCityData() ([]GeobedCity, error) {
 }
 
 func loadGeobedCountryData() ([]CountryInfo, error) {
-	fh, err := openOptionallyBzippedFile("geobed-cache/g.co.dmp")
+	fh, cleanup, err := openOptionallyBzippedFile("geobed-cache/g.co.dmp")
 	if err != nil {
 		return nil, err
 	}
+	defer cleanup()
+
 	co := []CountryInfo{}
 	dec := gob.NewDecoder(fh)
 	if err := dec.Decode(&co); err != nil {
@@ -1450,10 +1464,12 @@ func loadGeobedCountryData() ([]CountryInfo, error) {
 }
 
 func loadGeobedCityNameIdx() (map[string]int, error) {
-	fh, err := openOptionallyBzippedFile("geobed-cache/cityNameIdx.dmp")
+	fh, cleanup, err := openOptionallyBzippedFile("geobed-cache/cityNameIdx.dmp")
 	if err != nil {
 		return nil, err
 	}
+	defer cleanup()
+
 	idx := make(map[string]int)
 	dec := gob.NewDecoder(fh)
 	if err := dec.Decode(&idx); err != nil {
