@@ -1,6 +1,6 @@
 module github.com/andreiashu/geobed
 
-go 1.23.0
+go 1.24
 
 require (
 	github.com/TomiHiltunen/geohash-golang v0.0.0-20150112065804-b3e4e625abfb
