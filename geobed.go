@@ -130,6 +130,8 @@ func newStringInterner[T ~uint8 | ~uint16](capacity int) *stringInterner[T] {
 
 // intern returns the index for a string, creating it if needed.
 // Thread-safe: uses double-checked locking pattern.
+// Panics if the interner capacity is exceeded (should never happen with uint16
+// and real-world datasets, but protects against silent data corruption).
 func (si *stringInterner[T]) intern(s string) T {
 	// Fast path: check with read lock
 	si.mu.RLock()
@@ -145,6 +147,14 @@ func (si *stringInterner[T]) intern(s string) T {
 	if idx, ok := si.index[s]; ok {
 		return idx
 	}
+
+	// Overflow protection: check if we've exceeded the type's capacity
+	// This prevents silent data corruption from index wraparound
+	maxVal := int(^T(0)) // Maximum value for type T (e.g., 65535 for uint16)
+	if len(si.lookup) >= maxVal {
+		panic(fmt.Sprintf("stringInterner capacity exceeded: %d entries (max %d)", len(si.lookup), maxVal))
+	}
+
 	idx := T(len(si.lookup))
 	si.lookup = append(si.lookup, s)
 	si.index[s] = idx
@@ -169,7 +179,11 @@ func (si *stringInterner[T]) count() int {
 }
 
 var (
-	countryInterner *stringInterner[uint8]
+	// WHY uint16 for both: The Geonames dataset contains ~252 countries.
+	// Using uint8 (max 255) would be dangerously close to the limit and could
+	// overflow if the dataset grows or custom countries are added. uint16 provides
+	// ample headroom (max 65535) at minimal memory cost due to struct alignment.
+	countryInterner *stringInterner[uint16]
 	regionInterner  *stringInterner[uint16]
 	lookupOnce      sync.Once
 )
@@ -254,7 +268,7 @@ func compareCaseInsensitive(a, b string) int {
 type GeobedCity struct {
 	City       string  // City name
 	CityAlt    string  // Alternate names (comma-separated)
-	country    uint8   // Index into countryLookup
+	country    uint16  // Index into countryLookup (uint16 to safely handle 252+ countries)
 	region     uint16  // Index into regionLookup
 	Latitude   float32 // Latitude in degrees
 	Longitude  float32 // Longitude in degrees
@@ -401,12 +415,13 @@ func NewGeobed(opts ...Option) (*GeoBed, error) {
 
 // initLookupTables initializes the country and region string interners.
 func initLookupTables() {
-	countryInterner = newStringInterner[uint8](256)
-	regionInterner = newStringInterner[uint16](8192)
+	// Capacity hints for initial allocation (will grow if needed)
+	countryInterner = newStringInterner[uint16](300)  // ~252 countries in Geonames
+	regionInterner = newStringInterner[uint16](8192)  // ~4000+ admin regions worldwide
 }
 
 // internCountry returns the index for a country code, creating it if needed.
-func internCountry(code string) uint8 {
+func internCountry(code string) uint16 {
 	return countryInterner.intern(code)
 }
 
