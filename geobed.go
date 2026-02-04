@@ -222,23 +222,31 @@ func (c Cities) Len() int           { return len(c) }
 func (c Cities) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
 func (c Cities) Less(i, j int) bool { return compareCaseInsensitive(c[i].City, c[j].City) < 0 }
 
-// compareCaseInsensitive compares two strings case-insensitively without allocation.
+// compareCaseInsensitive compares two strings case-insensitively.
 // Returns negative if a < b, positive if a > b, zero if equal.
+//
+// WHY USE strings.ToLower: This function is used in the sort.Interface Less()
+// method for sorting cities alphabetically. While a custom byte-level ASCII
+// comparison would avoid allocations, it would BREAK sorting for international
+// city names (e.g., "Zürich" vs "Zwolle" would sort incorrectly if 'ü' is
+// compared as raw bytes instead of as a Unicode lowercase character).
+//
+// The Geonames dataset contains ~145K cities from around the world with names
+// in many languages. Correct Unicode sorting is essential for the search index
+// to work properly with international queries.
+//
+// Performance note: This is called O(N log N) times during sort, but the sort
+// only happens once during initialization, not during geocode queries.
 func compareCaseInsensitive(a, b string) int {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		ca, cb := a[i], b[i]
-		// Convert to lowercase inline
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return int(ca) - int(cb)
-		}
+	aLower := strings.ToLower(a)
+	bLower := strings.ToLower(b)
+	if aLower < bLower {
+		return -1
 	}
-	return len(a) - len(b)
+	if aLower > bLower {
+		return 1
+	}
+	return 0
 }
 
 // GeobedCity represents a city with geocoding data.
@@ -444,7 +452,10 @@ func (g *GeoBed) cellAndNeighbors(cell s2.CellID) []s2.CellID {
 
 // downloadDataSets downloads the raw data files if they don't exist locally.
 func (g *GeoBed) downloadDataSets() error {
-	if err := os.MkdirAll(g.config.DataDir, 0777); err != nil {
+	// WHY 0755: Using restrictive permissions (rwxr-xr-x) instead of world-writable (0777)
+	// to prevent security issues (CWE-732) in shared environments like Kubernetes or
+	// multi-user servers where other users could inject malicious data files.
+	if err := os.MkdirAll(g.config.DataDir, 0755); err != nil {
 		return fmt.Errorf("creating data directory: %w", err)
 	}
 
@@ -1038,20 +1049,32 @@ func (g *GeoBed) getSearchRange(nSlice []string) []r {
 	for _, ns := range nSlice {
 		ns = strings.TrimSuffix(ns, ",")
 		if len(ns) > 0 {
-			fc := toLower(string(ns[0]))
-			pik := string(prev(rune(fc[0])))
+			fc := strings.ToLower(string([]rune(ns)[0]))
+			pik := string(prev([]rune(fc)[0]))
+
+			// cityNameIdx stores the LAST index of cities starting with each letter.
+			// Go slices are half-open [start:end), so we need to:
+			// 1. Start at (previous letter's last index + 1) = first city of current letter
+			// 2. End at (current letter's last index + 1) to include the last city
 
 			fk := 0
-			tk := 0
 			if val, ok := g.cityNameIdx[pik]; ok {
-				fk = val
+				fk = val + 1 // Start after the last city of previous letter
 			}
+
+			tk := len(g.Cities) // Default to end of slice
 			if val, ok := g.cityNameIdx[fc]; ok {
-				tk = val
+				tk = val + 1 // Include the last city of current letter (half-open interval)
 			}
-			if tk == 0 {
-				tk = len(g.Cities) - 1
+
+			// Ensure bounds are valid
+			if fk > tk {
+				fk = tk
 			}
+			if tk > len(g.Cities) {
+				tk = len(g.Cities)
+			}
+
 			ranges = append(ranges, r{fk, tk})
 		}
 	}
@@ -1092,28 +1115,29 @@ func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
 	return closest
 }
 
+// toLower converts a string to lowercase using the standard library.
+//
+// WHY USE STANDARD LIBRARY: The Geonames cities1000.zip dataset contains UTF-8
+// encoded city names with international characters (e.g., "Zürich", "東京", "São Paulo").
+// Custom byte-level ASCII-only implementations would corrupt or incorrectly sort
+// multi-byte UTF-8 characters. The standard library's strings.ToLower is:
+// 1. Unicode-aware - correctly handles all UTF-8 characters
+// 2. Well-optimized - uses SIMD instructions on modern CPUs for ASCII-heavy strings
+// 3. Correct - tested against the full Unicode character set
+//
+// DO NOT replace with a custom byte-level implementation for "performance" -
+// the minor allocation savings are not worth breaking international city support.
 func toLower(s string) string {
-	b := make([]byte, len(s))
-	for i := range b {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		b[i] = c
-	}
-	return string(b)
+	return strings.ToLower(s)
 }
 
+// toUpper converts a string to uppercase using the standard library.
+//
+// WHY USE STANDARD LIBRARY: Same rationale as toLower - the Geonames dataset
+// contains international city names that require proper Unicode handling.
+// See toLower documentation for full explanation.
 func toUpper(s string) string {
-	b := make([]byte, len(s))
-	for i := range b {
-		c := s[i]
-		if c >= 'a' && c <= 'z' {
-			c -= 'a' - 'A'
-		}
-		b[i] = c
-	}
-	return string(b)
+	return strings.ToUpper(s)
 }
 
 // RegenerateCache forces a reload from raw data files and regenerates the cache.
@@ -1238,7 +1262,11 @@ func ValidateCache() error {
 // store saves the Geobed data to disk cache.
 func (g *GeoBed) store() error {
 	cacheDir := g.config.CacheDir
-	if err := os.MkdirAll(cacheDir, 0777); err != nil {
+	// WHY 0755/0644: Restrictive permissions to prevent security issues (CWE-732).
+	// Directories get 0755 (rwxr-xr-x), files get 0644 (rw-r--r--).
+	// In shared environments, world-writable permissions would allow malicious
+	// actors to replace cache files and compromise geocoding results.
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return fmt.Errorf("creating cache directory: %w", err)
 	}
 
@@ -1262,7 +1290,7 @@ func (g *GeoBed) store() error {
 	if err := enc.Encode(gobCities); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(cacheDir, "g.c.dmp"), b.Bytes(), 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, "g.c.dmp"), b.Bytes(), 0644); err != nil {
 		return err
 	}
 
@@ -1270,7 +1298,7 @@ func (g *GeoBed) store() error {
 	if err := enc.Encode(g.Countries); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(cacheDir, "g.co.dmp"), b.Bytes(), 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, "g.co.dmp"), b.Bytes(), 0644); err != nil {
 		return err
 	}
 
@@ -1278,7 +1306,7 @@ func (g *GeoBed) store() error {
 	if err := enc.Encode(g.cityNameIdx); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(cacheDir, "cityNameIdx.dmp"), b.Bytes(), 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, "cityNameIdx.dmp"), b.Bytes(), 0644); err != nil {
 		return err
 	}
 
