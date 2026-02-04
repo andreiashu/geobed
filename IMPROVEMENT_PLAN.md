@@ -13,8 +13,13 @@
 |-------|--------|--------|
 | Phase 1: Critical Fixes | ✅ Complete | `cf194e4` |
 | Phase 2: Thread Safety & API | ✅ Complete | `cf194e4` |
-| Phase 3: Performance | ✅ Complete | `7c60787` (S2 index) |
+| Phase 3: Performance | ✅ Complete | `0e66574` (memory), `7c60787` (S2 index), `f775f77` (geocode fix) |
 | Phase 4: Polish | 🔲 Pending | - |
+
+### Key Achievements
+- **Memory reduced by 49%**: 431MB → 218MB via struct field optimization
+- **Reverse geocoding ~12,000x faster**: O(n) scan → S2 cell-based index (~8μs/query)
+- **Fixed "New York" geocoding bug**: Off-by-one indexing error in fuzzy matching
 
 ---
 
@@ -220,43 +225,52 @@ func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
 
 ---
 
-### 2.3 No String Interning
+### 2.3 ✅ Memory Optimization — FIXED
+
+**Status:** Fixed in commit `0e66574`
 
 **Problem:**
 
-City names like "Paris", "London", "Springfield" appear multiple times across the dataset. Each occurrence allocates separate memory.
+The original `GeobedCity` struct used strings for Country and Region fields. With 2.38M cities, each having a 16-byte string header for repeated values like "US" and "TX", memory was excessive (~431MB).
 
-**Synthesis:**
+**Investigation:**
 
-Go 1.23 introduced the [`unique` package](https://go.dev/blog/unique) for canonical value deduplication. As explained by [VictoriaMetrics](https://victoriametrics.com/blog/go-unique-package-intern-string/):
-- "When you've got several identical values, you only store one copy"
-- "Comparison of two Handle[T] values is cheap: it comes down to a pointer comparison"
-- Automatic garbage collection of unused interned strings
+1. Go 1.23's `unique` package was tested but didn't help - each struct field still has its own string header
+2. Manual string deduplication didn't help for the same reason
+3. Analysis revealed only 248 unique country codes and 751 unique region codes across 2.38M cities
 
-For pre-1.23 compatibility, [go4.org/intern](https://commaok.xyz/post/intern-strings/) provides similar functionality.
+**Solution Applied:**
 
-**Solution:**
-
-Use `unique.Make()` for frequently repeated strings:
+Replaced string fields with integer indexes into lookup tables:
 ```go
-import "unique"
+var (
+    countryLookup []string          // index -> country code (248 entries)
+    regionLookup  []string          // index -> region code (751 entries)
+)
 
 type GeobedCity struct {
-    City       unique.Handle[string]  // Interned
-    CityAlt    string                 // Not interned (unique per city)
-    Country    unique.Handle[string]  // Interned (only ~200 values)
-    Region     unique.Handle[string]  // Interned
-    // ...
+    City       string   // City name
+    CityAlt    string   // Alternate names
+    country    uint8    // Index into countryLookup (was: string)
+    region     uint16   // Index into regionLookup (was: string)
+    Latitude   float32  // Was: float64
+    Longitude  float32  // Was: float64
+    Population int32
 }
 
-// During loading:
-city.Country = unique.Make(countryCode)
-city.City = unique.Make(cityName)
+func (c GeobedCity) Country() string {
+    if int(c.country) < len(countryLookup) {
+        return countryLookup[c.country]
+    }
+    return ""
+}
 ```
 
-**Expected Improvement:** 15-30% memory reduction for string data
+Also removed `Geohash` field entirely (no longer needed with S2 spatial index).
 
-**Files:** `geobed.go` (GeobedCity struct, loading functions)
+**Actual Improvement:** 49% memory reduction (431MB → 218MB)
+
+**Files:** `geobed.go` (GeobedCity struct, lookup tables, accessor methods)
 
 ---
 
@@ -313,6 +327,50 @@ func GetDefaultGeobed() (*GeoBed, error) {
 ```
 
 Note: `locationDedupeIdx` and `maxMindCityDedupeIdx` remain as temporary globals used only during data loading and are cleared after use.
+
+---
+
+### 2.5 ✅ Off-by-One Indexing Bug in Fuzzy Matching — FIXED
+
+**Status:** Fixed in commit `f775f77`
+
+**Problem:**
+
+Queries like "New York, NY" returned "New York Mills, MN" instead of "New York City, NY". The bug was in `fuzzyMatchLocation()`:
+
+```go
+// BUGGY CODE:
+for _, rng := range ranges {
+    currentKey := rng.f
+    for _, v := range g.c[rng.f:rng.t] {
+        currentKey++  // Increments BEFORE use - cities stored at wrong index!
+        // ... scoring logic using currentKey ...
+    }
+}
+```
+
+The `currentKey++` happened before the city was scored, causing cities to be associated with the wrong index. When the best match was found, it retrieved the wrong city.
+
+**Solution Applied:**
+
+```go
+// FIXED CODE:
+for _, rng := range ranges {
+    for i, v := range g.c[rng.f:rng.t] {
+        currentKey := rng.f + i  // Correct index into g.c
+        // ... scoring logic using currentKey ...
+    }
+}
+```
+
+**Regression Tests Added:** `geocode_test.go` with test cases for:
+- "New York" → "New York", NY
+- "New York, NY" → "New York City", NY
+- "New York City" → "New York City", NY
+- "Austin, TX" → "Austin", TX
+- "Paris" → "Paris", FR
+
+**Files:** `geobed.go:626+`, `geocode_test.go` (new)
 
 ---
 
@@ -804,7 +862,8 @@ upx --best geobed                 # Compress with UPX
 | **P1** | Thread-safe initialization | Data race | Medium | Memory/Perf | ✅ Done |
 | **P1** | Return errors from NewGeobed | API breaking | Medium | Critical | ✅ Done |
 | **P2** | S2 spatial index | Performance | High | Memory/Perf | ✅ Done |
-| **P2** | String interning | Memory | Medium | Memory/Perf | ⏭️ Deferred |
+| **P2** | Memory optimization | Memory | Medium | Memory/Perf | ✅ Done (49% reduction) |
+| **P2** | Off-by-one geocoding bug | Correctness | Low | Critical | ✅ Done |
 | **P2** | API documentation | Usability | Medium | Docs | ✅ Done |
 | **P3** | Remove commented code | Maintainability | Low | Code Quality | ✅ Done |
 | **P3** | Type-safe data sources | Maintainability | Low | Code Quality | 🔲 Pending |
@@ -834,8 +893,9 @@ upx --best geobed                 # Compress with UPX
 
 ### Phase 3: Performance ✅ COMPLETE
 1. ✅ Implement S2 spatial index (commit `7c60787`) — **~12,000x speedup**
-2. ⏭️ String interning — deferred (moderate benefit, adds complexity)
-3. ⏭️ Comprehensive benchmarks — deferred (basic benchmarks exist)
+2. ✅ Memory optimization (commit `0e66574`) — **49% reduction (431MB → 218MB)**
+3. ✅ Fix off-by-one geocoding bug (commit `f775f77`) — **"New York, NY" now works**
+4. ⏭️ String interning — abandoned (tested, didn't help due to Go string header overhead)
 
 ### Phase 4: Polish (Week 5+)
 1. 🔲 Add comprehensive test cases
