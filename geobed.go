@@ -825,18 +825,29 @@ func (g *GeoBed) exactMatchCity(n string) GeobedCity {
 	if len(matchingCities) == 1 {
 		return matchingCities[0]
 	} else if len(matchingCities) > 1 {
+		// Find best match by region, using population as tie-breaker
 		for _, city := range matchingCities {
 			if strings.EqualFold(nSt, city.Region()) {
-				c = city
+				if c.City == "" || city.Population > c.Population {
+					c = city
+				}
 			}
 		}
 
+		// Prefer matches with both region AND country, using population as tie-breaker
+		var bestRegionAndCountry GeobedCity
 		for _, city := range matchingCities {
 			if strings.EqualFold(nSt, city.Region()) && strings.EqualFold(nCo, city.Country()) {
-				c = city
+				if bestRegionAndCountry.City == "" || city.Population > bestRegionAndCountry.Population {
+					bestRegionAndCountry = city
+				}
 			}
 		}
+		if bestRegionAndCountry.City != "" {
+			c = bestRegionAndCountry
+		}
 
+		// If no region/country match, use country match with highest population
 		if c.City == "" {
 			matchingCountryCities := []GeobedCity{}
 			for _, city := range matchingCities {
