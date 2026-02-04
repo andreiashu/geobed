@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/agnivade/levenshtein"
 	"github.com/golang/geo/s2"
 )
 
@@ -174,7 +175,8 @@ type CountryInfo struct {
 
 // GeocodeOptions configures geocoding behavior.
 type GeocodeOptions struct {
-	ExactCity bool // Require exact city name match
+	ExactCity     bool // Require exact city name match
+	FuzzyDistance int  // Max edit distance for typo tolerance (0 = disabled, 1-2 recommended)
 }
 
 // r represents an index range for city searches.
@@ -544,6 +546,20 @@ func (g *GeoBed) loadGeonamesCountryInfo(path string, tabSplitter *regexp.Regexp
 	return nil
 }
 
+// fuzzyMatch compares two strings with optional Levenshtein distance tolerance.
+// If maxDist is 0, performs exact case-insensitive match.
+// Otherwise, returns true if the edit distance between the strings is <= maxDist.
+func fuzzyMatch(query, candidate string, maxDist int) bool {
+	if maxDist == 0 {
+		return strings.EqualFold(query, candidate)
+	}
+	dist := levenshtein.ComputeDistance(
+		strings.ToLower(query),
+		strings.ToLower(candidate),
+	)
+	return dist <= maxDist
+}
+
 // Geocode performs forward geocoding, converting a location string to coordinates.
 func (g *GeoBed) Geocode(n string, opts ...GeocodeOptions) GeobedCity {
 	var c GeobedCity
@@ -560,7 +576,7 @@ func (g *GeoBed) Geocode(n string, opts ...GeocodeOptions) GeobedCity {
 	if options.ExactCity {
 		c = g.exactMatchCity(n)
 	} else {
-		c = g.fuzzyMatchLocation(n)
+		c = g.fuzzyMatchLocation(n, options)
 	}
 	return c
 }
@@ -619,7 +635,7 @@ func (g *GeoBed) exactMatchCity(n string) GeobedCity {
 	return c
 }
 
-func (g *GeoBed) fuzzyMatchLocation(n string) GeobedCity {
+func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 	nCo, nSt, abbrevSlice, nSlice := g.extractLocationPieces(n)
 	ranges := g.getSearchRange(nSlice)
 
@@ -669,8 +685,18 @@ func (g *GeoBed) fuzzyMatchLocation(n string) GeobedCity {
 				}
 			}
 
+			// Exact match gets highest bonus
 			if strings.EqualFold(n, v.City) {
 				bestMatchingKeys[currentKey] += 7
+			} else if opts.FuzzyDistance > 0 {
+				// Fuzzy matching with Levenshtein distance
+				for _, ns := range nSlice {
+					ns = strings.TrimSuffix(ns, ",")
+					if len(ns) > 2 && fuzzyMatch(ns, v.City, opts.FuzzyDistance) {
+						// Fuzzy match gets slightly lower bonus than exact match
+						bestMatchingKeys[currentKey] += 5
+					}
+				}
 			}
 
 			for _, ns := range nSlice {
