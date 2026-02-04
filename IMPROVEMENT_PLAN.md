@@ -811,47 +811,6 @@ func NewGeobed() (*GeoBed, error) { ... }
 
 ---
 
-### 6.2 Large Binary Size
-
-**Problem:**
-
-Embedded cache adds ~56MB to binary, unsuitable for some deployments.
-
-**Synthesis:**
-
-Per [Go embed best practices](https://vincent.bernat.ch/en/blog/2025-go-embed-compressed), options include:
-- ZIP compression of assets
-- Build tags for optional embedding
-- Binary packers (UPX)
-
-**Solution:**
-
-Add build tags for lite version:
-```go
-//go:build !geobed_lite
-
-//go:embed geobed-cache
-var geobedCache embed.FS
-```
-
-```go
-//go:build geobed_lite
-
-// Lite version downloads data on first use
-var geobedCache embed.FS // Empty
-```
-
-Build commands:
-```bash
-go build                          # Full version (~60MB)
-go build -tags geobed_lite        # Lite version (~5MB, downloads data)
-upx --best geobed                 # Compress with UPX
-```
-
-**Files:** `geobed.go`, `geobed_lite.go` (new)
-
----
-
 ## 7. Implementation Priority Matrix
 
 | Priority | Issue | Impact | Effort | Category | Status |
@@ -871,7 +830,6 @@ upx --best geobed                 # Compress with UPX
 | **P3** | Comprehensive tests | Reliability | Medium | Testing | 🔲 Pending |
 | **P4** | Fuzzy matching (Levenshtein) | Feature | Medium | Design | 🔲 Pending |
 | **P4** | International admin divisions | Feature | High | Design | 🔲 Pending |
-| **P4** | Build tags for lite version | Deployment | Medium | Operational |🔲 Pending |
 | **P4** | Data update mechanism | Freshness | Medium | Operational | 🔲 Pending |
 
 ---
@@ -899,9 +857,8 @@ upx --best geobed                 # Compress with UPX
 
 ### Phase 4: Polish (Week 5+)
 1. 🔲 Add comprehensive test cases
-2. 🔲 Add build tags for lite version
-3. 🔲 Implement configurable paths
-4. 🔲 Add data update tooling
+2. 🔲 Implement configurable paths
+3. 🔲 Add data update tooling
 
 ---
 
