@@ -1025,7 +1025,7 @@ func toUpper(s string) string {
 //
 //	bzip2 -f geobed-cache/*.dmp
 func RegenerateCache() error {
-	g := &GeoBed{}
+	g := &GeoBed{config: defaultConfig()}
 
 	// Initialize lookup tables
 	lookupOnce.Do(initLookupTables)
