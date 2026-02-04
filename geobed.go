@@ -756,11 +756,44 @@ func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []st
 	}
 
 	nSt := ""
+	// First check US state codes (most common case)
 	for sc := range UsStateCodes {
 		re = regexp.MustCompile("(?i)^" + sc + ",?\\s|\\s" + sc + ",?\\s|\\s" + sc + "$")
 		if re.MatchString(n) {
 			nSt = sc
 			n = re.ReplaceAllString(n, "")
+			// If we matched a US state, set country to US if not already set
+			if nCo == "" {
+				nCo = "US"
+			}
+		}
+	}
+
+	// If no US state matched, check international admin divisions
+	if nSt == "" {
+		// Load admin divisions (lazy, thread-safe)
+		loadAdminDivisions()
+
+		// Look for 2-3 letter codes at end of query that could be admin divisions
+		// Pattern: "Toronto, ON" or "Sydney NSW"
+		parts := strings.Split(n, " ")
+		if len(parts) >= 2 {
+			lastPart := strings.Trim(parts[len(parts)-1], ", ")
+			if len(lastPart) >= 2 && len(lastPart) <= 3 {
+				lastPartUpper := toUpper(lastPart)
+				// If we know the country, check if it's a valid division for that country
+				if nCo != "" && isAdminDivision(nCo, lastPartUpper) {
+					nSt = lastPartUpper
+					n = strings.Join(parts[:len(parts)-1], " ")
+				} else if nCo == "" {
+					// Try to find an unambiguous admin division
+					if country := getAdminDivisionCountry(lastPartUpper); country != "" {
+						nSt = lastPartUpper
+						nCo = country
+						n = strings.Join(parts[:len(parts)-1], " ")
+					}
+				}
+			}
 		}
 	}
 	n = strings.Trim(n, " ,")

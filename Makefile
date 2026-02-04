@@ -42,12 +42,16 @@ download-data:
 	@curl -f -o geobed-data/cities1000.zip http://download.geonames.org/export/dump/cities1000.zip
 	@echo "Downloading countryInfo.txt..."
 	@curl -f -o geobed-data/countryInfo.txt http://download.geonames.org/export/dump/countryInfo.txt
+	@echo "Downloading admin1CodesASCII.txt..."
+	@curl -f -o geobed-data/admin1CodesASCII.txt http://download.geonames.org/export/dump/admin1CodesASCII.txt
 	@echo ""
 	@echo "Validating downloads..."
 	@test $$(stat -f%z geobed-data/cities1000.zip 2>/dev/null || stat -c%s geobed-data/cities1000.zip) -gt 5000000 \
 		|| (echo "ERROR: cities1000.zip too small (download failed?)" && exit 1)
 	@test $$(stat -f%z geobed-data/countryInfo.txt 2>/dev/null || stat -c%s geobed-data/countryInfo.txt) -gt 20000 \
 		|| (echo "ERROR: countryInfo.txt too small (download failed?)" && exit 1)
+	@test $$(stat -f%z geobed-data/admin1CodesASCII.txt 2>/dev/null || stat -c%s geobed-data/admin1CodesASCII.txt) -gt 10000 \
+		|| (echo "ERROR: admin1CodesASCII.txt too small (download failed?)" && exit 1)
 	@echo "Download complete and validated."
 
 # Regenerate cache from raw data files (includes validation)

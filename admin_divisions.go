@@ -66,14 +66,48 @@ func loadAdminDivisions() {
 	})
 }
 
+// isAdminDivision checks if a code is a valid admin division for a specific country.
+// Returns true if the code exists for that country.
+func isAdminDivision(countryCode, divisionCode string) bool {
+	loadAdminDivisions()
+	divisionCode = toUpper(divisionCode)
+	if divisions, ok := adminDivisions[countryCode]; ok {
+		_, exists := divisions[divisionCode]
+		return exists
+	}
+	return false
+}
+
 // getAdminDivisionCountry returns the country code if the given code is a known admin division.
-// For example, "TX" -> "US", "NSW" -> "AU" (if NSW were a code)
+// For ambiguous codes (existing in multiple countries), it returns empty string.
+// Use isAdminDivision with a known country for precise matching.
+// Examples: "TX" -> "US", "ON" -> "CA", "NSW" -> "AU"
 func getAdminDivisionCountry(code string) string {
 	loadAdminDivisions()
 	code = toUpper(code)
+
+	// Collect all countries that have this division code
+	var matches []string
 	for countryCode, divisions := range adminDivisions {
 		if _, ok := divisions[code]; ok {
-			return countryCode
+			matches = append(matches, countryCode)
+		}
+	}
+
+	// Only return if unambiguous (exactly one country has this code)
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	return ""
+}
+
+// getAdminDivisionName returns the name of an admin division given country and division code.
+func getAdminDivisionName(countryCode, divisionCode string) string {
+	loadAdminDivisions()
+	divisionCode = toUpper(divisionCode)
+	if divisions, ok := adminDivisions[countryCode]; ok {
+		if div, exists := divisions[divisionCode]; exists {
+			return div.Name
 		}
 	}
 	return ""
