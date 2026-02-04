@@ -6,7 +6,6 @@ import (
 	. "gopkg.in/check.v1"
 )
 
-// Hook up gocheck into the "go test" runner.
 func Test(t *testing.T) { TestingT(t) }
 
 type GeobedSuite struct {
@@ -18,10 +17,6 @@ var _ = Suite(&GeobedSuite{})
 var g *GeoBed
 
 func (s *GeobedSuite) SetUpSuite(c *C) {
-	// Note: The fuzzy matcher has known issues with ambiguous queries.
-	// These test cases are selected to work reliably with the current algorithm.
-	// See IMPROVEMENT_PLAN.md for planned improvements to fuzzy matching.
-
 	s.testLocations = append(s.testLocations, map[string]string{"query": "Austin", "city": "Austin", "country": "US", "region": "TX"})
 	s.testLocations = append(s.testLocations, map[string]string{"query": "Paris", "city": "Paris", "country": "FR", "region": ""})
 	s.testLocations = append(s.testLocations, map[string]string{"query": "Sydney", "city": "Sydney", "country": "AU", "region": ""})
@@ -42,15 +37,12 @@ func (s *GeobedSuite) TestANewGeobed(c *C) {
 }
 
 func (s *GeobedSuite) TestGeocode(c *C) {
-	//g := NewGeobed()
 	for _, v := range s.testLocations {
 		r := g.Geocode(v["query"])
 		c.Assert(r.City, Equals, v["city"])
-		c.Assert(r.Country, Equals, v["country"])
-		// Due to all the data and various sets, the region can be a little weird. It's intended to be US state first and foremost (where it is most helpful in geocoding).
-		// TODO: Look back into this later and try to make sense of it all. It may end up needing to be multiple fields (which will further complicate the matching).
+		c.Assert(r.Country(), Equals, v["country"])
 		if v["region"] != "" {
-			c.Assert(r.Region, Equals, v["region"])
+			c.Assert(r.Region(), Equals, v["region"])
 		}
 	}
 
@@ -62,17 +54,15 @@ func (s *GeobedSuite) TestGeocode(c *C) {
 }
 
 func (s *GeobedSuite) TestReverseGeocode(c *C) {
-	//g := NewGeobed()
-
 	r := g.ReverseGeocode(30.26715, -97.74306)
 	c.Assert(r.City, Equals, "Austin")
-	c.Assert(r.Region, Equals, "TX")
-	c.Assert(r.Country, Equals, "US")
+	c.Assert(r.Region(), Equals, "TX")
+	c.Assert(r.Country(), Equals, "US")
 
 	r = g.ReverseGeocode(37.44651, -122.15322)
 	c.Assert(r.City, Equals, "Palo Alto")
-	c.Assert(r.Region, Equals, "CA")
-	c.Assert(r.Country, Equals, "US")
+	c.Assert(r.Region(), Equals, "CA")
+	c.Assert(r.Country(), Equals, "US")
 
 	// Use precise Santa Cruz city center coordinates
 	r = g.ReverseGeocode(36.9741, -122.0308)
