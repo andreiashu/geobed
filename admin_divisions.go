@@ -47,8 +47,10 @@ func loadAdminDivisionsForDir(dataDir string) map[string]map[string]AdminDivisio
 	// Try to load from file
 	fi, err := os.Open(dataDir + "/admin1CodesASCII.txt")
 	if err != nil {
-		// Cache the empty result to avoid repeated failed attempts
-		adminDivisionsCache[dataDir] = divisions
+		// DO NOT cache failures - allows retry on next call
+		// This handles transient I/O errors (file being written during
+		// concurrent download, temporary permission issues, etc.)
+		// Only cache successful loads to avoid repeated disk access
 		return divisions
 	}
 	defer fi.Close()
