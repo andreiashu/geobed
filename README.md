@@ -161,7 +161,11 @@ Data snapshot: August 2023
 
 MIT License - see LICENSE file.
 
-Original work by Tom Maiaroto. Fork maintained by Andrei Simion.
+## Credits
+
+- **Tom Maiaroto** ([@tmaiaroto](https://github.com/tmaiaroto)) - Original author of geobed
+- **jvmatl** ([@jvmatl](https://github.com/jvmatl)) - Added embedded data files and offline capability
+- **Andrei Simion** ([@andreiashu](https://github.com/andreiashu)) - S2 spatial indexing, memory optimization, bug fixes
 
 ## Acknowledgments
 
