@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	geohash "github.com/TomiHiltunen/geohash-golang"
 )
@@ -49,12 +50,11 @@ import (
 //go:embed geobed-cache
 var cacheData embed.FS
 
-// A list of data sources.
+// dataSetFiles defines the data sources for geocoding data.
+// Additional sources can be enabled by adding entries here.
 var dataSetFiles = []map[string]string{
 	{"url": "http://download.geonames.org/export/dump/cities1000.zip", "path": "./geobed-data/cities1000.zip", "id": "geonamesCities1000"},
 	{"url": "http://download.geonames.org/export/dump/countryInfo.txt", "path": "./geobed-data/countryInfo.txt", "id": "geonamesCountryInfo"},
-	//{"url": "http://download.maxmind.com/download/worldcities/worldcitiespop.txt.gz", "path": "./geobed-data/worldcitiespop.txt.gz", "id": "maxmindWorldCities"},
-	//{"url": "http://geolite.maxmind.com/download/geoip/database/GeoLiteCity_CSV/GeoLiteCity-latest.zip", "path": "./geobed-data/GeoLiteCity-latest.zip", "id": "maxmindLiteCity"},
 }
 
 // A handy map of US state codes to full names.
@@ -125,10 +125,16 @@ var UsSateCodes = map[string]string{
 	"AP": "Armed Forces Pacific",
 }
 
-// Contains all of the city and country data. Cities are split into buckets by country to increase lookup speed when the country is known.
+// GeoBed provides offline geocoding capabilities using embedded city data.
+// It supports both forward geocoding (location name to coordinates) and reverse
+// geocoding (coordinates to location information).
+//
+// GeoBed instances are safe for concurrent use after initialization.
+// Initialization loads approximately 143,000+ city records into memory.
 type GeoBed struct {
-	c  Cities
-	co []CountryInfo
+	c           Cities
+	co          []CountryInfo
+	cityNameIdx map[string]int // index of city name first characters to slice positions
 }
 
 type Cities []GeobedCity
@@ -159,20 +165,30 @@ type GeobedCity struct {
 	Geohash    string
 }
 
-// TODO: String interning? (much like converting country code to int)
-// https://gist.github.com/karlseguin/6570372
-
-// TODO: Store the cities in mmap...???
-// https://github.com/boltdb/bolt/blob/master/bolt_unix.go#L42-L69
-// Maybe even use bolt?
-
-var maxMindCityDedupeIdx map[string][]string
-
-// Holds information about the index ranges for city names (1st and 2nd characters) to help narrow down sets of the GeobedCity slice to scan when looking for a match.
+// Temporary indices used during data loading (cleared after use).
 var (
-	cityNameIdx       map[string]int
-	locationDedupeIdx map[string]bool
+	maxMindCityDedupeIdx map[string][]string
+	locationDedupeIdx    map[string]bool
 )
+
+// Singleton pattern for default GeoBed instance.
+var (
+	defaultGeobed     *GeoBed
+	defaultGeobedOnce sync.Once
+	defaultGeobedErr  error
+)
+
+// GetDefaultGeobed returns a shared GeoBed instance, initializing it on first call.
+// This is the recommended way to obtain a GeoBed instance as it ensures
+// thread-safe initialization and reuses the same instance across calls.
+//
+// Returns an error if data cannot be loaded.
+func GetDefaultGeobed() (*GeoBed, error) {
+	defaultGeobedOnce.Do(func() {
+		defaultGeobed, defaultGeobedErr = NewGeobed()
+	})
+	return defaultGeobed, defaultGeobedErr
+}
 
 // Information about each country from Geonames including; ISO codes, FIPS, country capital, area (sq km), population, and more.
 // Particularly useful for validating a location string contains a country name which can help the search process.
@@ -210,9 +226,23 @@ type r struct {
 	t int
 }
 
-// Creates a new Geobed instance. You do not need more than one. You do not want more than one. There's a fair bit of data to load into memory.
-func NewGeobed() GeoBed {
-	g := GeoBed{}
+// NewGeobed creates a new GeoBed instance with geocoding data loaded into memory.
+// It first attempts to load from embedded cache files, falling back to downloading
+// and parsing raw data files if the cache is unavailable.
+//
+// Returns an error if data cannot be loaded from either source.
+// For a shared instance with thread-safe initialization, use GetDefaultGeobed() instead.
+//
+// Example:
+//
+//	g, err := NewGeobed()
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	city := g.Geocode("Austin, TX")
+//	fmt.Printf("%s: %f, %f\n", city.City, city.Latitude, city.Longitude)
+func NewGeobed() (*GeoBed, error) {
+	g := &GeoBed{}
 
 	var err error
 	g.c, err = loadGeobedCityData()
@@ -220,300 +250,318 @@ func NewGeobed() GeoBed {
 		g.co, err = loadGeobedCountryData()
 	}
 	if err == nil {
-		err = loadGeobedCityNameIdx()
+		g.cityNameIdx, err = loadGeobedCityNameIdx()
 	}
 	if err != nil || len(g.c) == 0 {
-		g.downloadDataSets()
-		g.loadDataSets()
-		g.store()
-	}
-
-	return g
-}
-
-// Downloads the data sets if needed.
-func (g *GeoBed) downloadDataSets() {
-	os.Mkdir("./geobed-data", 0777)
-	for _, f := range dataSetFiles {
-		_, err := os.Stat(f["path"])
-		if err != nil {
-			if os.IsNotExist(err) {
-				// log.Println(f["path"] + " does not exist, downloading...")
-				out, oErr := os.Create(f["path"])
-				defer out.Close()
-				if oErr == nil {
-					r, rErr := http.Get(f["url"])
-					defer r.Body.Close()
-					if rErr == nil {
-						_, nErr := io.Copy(out, r.Body)
-						if nErr != nil {
-							// log.Println("Failed to copy data file, it will be tried again on next application start.")
-							// remove file so another attempt can be made, should something fail
-							err = os.Remove(f["path"])
-						}
-						r.Body.Close()
-					}
-					out.Close()
-				} else {
-					log.Println(oErr)
-				}
-			}
+		// Cache not available, try downloading and parsing raw data
+		if downloadErr := g.downloadDataSets(); downloadErr != nil {
+			return nil, fmt.Errorf("failed to download data sets: %w", downloadErr)
+		}
+		if loadErr := g.loadDataSets(); loadErr != nil {
+			return nil, fmt.Errorf("failed to load data sets: %w", loadErr)
+		}
+		// Store cache for next time (non-fatal if this fails)
+		if storeErr := g.store(); storeErr != nil {
+			log.Printf("warning: failed to store cache: %v", storeErr)
 		}
 	}
+
+	return g, nil
 }
 
-// Unzips the data sets and loads the data.
-func (g *GeoBed) loadDataSets() {
+// downloadDataSets downloads the raw data files if they don't exist locally.
+// Returns an error if any download fails.
+func (g *GeoBed) downloadDataSets() error {
+	if err := os.MkdirAll("./geobed-data", 0777); err != nil {
+		return fmt.Errorf("creating data directory: %w", err)
+	}
+
+	for _, f := range dataSetFiles {
+		if _, err := os.Stat(f["path"]); err == nil {
+			// File already exists, skip download
+			continue
+		}
+
+		if err := downloadFile(f["url"], f["path"]); err != nil {
+			return fmt.Errorf("downloading %s: %w", f["id"], err)
+		}
+	}
+	return nil
+}
+
+// downloadFile downloads a URL to a local file path.
+func downloadFile(url, path string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("HTTP GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP GET %s: status %d", url, resp.StatusCode)
+	}
+
+	out, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("creating file %s: %w", path, err)
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		// Clean up partial file
+		os.Remove(path)
+		return fmt.Errorf("writing file %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// loadDataSets parses the raw data files and populates the GeoBed instance.
+// Returns an error if critical data files cannot be parsed.
+func (g *GeoBed) loadDataSets() error {
 	locationDedupeIdx = make(map[string]bool)
+	tabSplitter := regexp.MustCompile("\t")
 
 	for _, f := range dataSetFiles {
-		// This one is zipped
-		if f["id"] == "geonamesCities1000" {
-			rz, err := zip.OpenReader(f["path"])
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer rz.Close()
-
-			for _, uF := range rz.File {
-				fi, err := uF.Open()
-				if err != nil {
-					log.Fatal(err)
-				}
-				defer fi.Close()
-
-				// Geonames uses a tab delineated format and it's not even consistent. No CSV reader that I've found for Go can understand this.
-				// I'm not expecting any reader to either because it's an invalid CSV to be frank. However, we can still split up each row by \t
-				scanner := bufio.NewScanner(fi)
-				scanner.Split(bufio.ScanLines)
-
-				i := 1
-				for scanner.Scan() {
-					i++
-
-					// So regexp, sadly, must be used (well, unless I wanted parse each string byte by byte, pushing each into a buffer to append to a slice until a tab is reached, etc.).
-					// But I'd have to also then put in a condition if the next byte was a \t rune, then append an empty string, etc. This just, for now, seems nicer (easier).
-					// This is only an import/update, so it shouldn't be an issue for performance. If it is, then I'll look into other solutions.
-					fields := regexp.MustCompile("\t").Split(scanner.Text(), 19)
-
-					// NOTE: Now using a combined GeobedCity struct since not all data sets have the same fields.
-					// Plus, the entire point was to geocode forward and reverse. Bonus information like elevation and such is just superfluous.
-					// Leaving it here because it may be configurable... If options are passed to NewGeobed() then maybe Geobed can simply be a Geonames search.
-					// Don't even load in MaxMind data...And if that's the case, maybe that bonus information is desired.
-					if len(fields) == 19 {
-						// id, _ := strconv.Atoi(fields[0])
-						lat, _ := strconv.ParseFloat(fields[4], 64)
-						lng, _ := strconv.ParseFloat(fields[5], 64)
-						pop, _ := strconv.Atoi(fields[14])
-						// elv, _ := strconv.Atoi(fields[15])
-						// dem, _ := strconv.Atoi(fields[16])
-
-						gh := geohash.Encode(lat, lng)
-						// This is produced with empty lat/lng values - don't store it.
-						if gh == "7zzzzzzzzzzz" {
-							gh = ""
-						}
-
-						var c GeobedCity
-						c.City = strings.Trim(string(fields[1]), " ")
-						c.CityAlt = string(fields[3])
-						c.Country = string(fields[8])
-						c.Region = string(fields[10])
-						c.Latitude = lat
-						c.Longitude = lng
-						c.Population = int32(pop)
-						c.Geohash = gh
-
-						// Don't include entries without a city name. If we want to geocode the centers of countries and states, then we can do that faster through other means.
-						if len(c.City) > 0 {
-							g.c = append(g.c, c)
-						}
-					}
-				}
-			}
-		}
-
-		// ...And this one is Gzipped (and this one may have worked with the CSV package, but parse it the same way as the others line by line)
-		if f["id"] == "maxmindWorldCities" {
-			// It also has a lot of dupes
-			maxMindCityDedupeIdx = make(map[string][]string)
-
-			fi, err := os.Open(f["path"])
-			if err != nil {
-				log.Println(err)
-			}
-			defer fi.Close()
-
-			fz, err := gzip.NewReader(fi)
-			if err != nil {
-				log.Println(err)
-			}
-			defer fz.Close()
-
-			scanner := bufio.NewScanner(fz)
-			scanner.Split(bufio.ScanLines)
-
-			i := 1
-			for scanner.Scan() {
-				i++
-				t := scanner.Text()
-
-				fields := strings.Split(t, ",")
-				if len(fields) == 7 {
-					var b bytes.Buffer
-					b.WriteString(fields[0]) // country
-					b.WriteString(fields[3]) // region
-					b.WriteString(fields[1]) // city
-
-					idx := b.String()
-					b.Reset()
-					maxMindCityDedupeIdx[idx] = fields
-				}
+		switch f["id"] {
+		case "geonamesCities1000":
+			if err := g.loadGeonamesCities(f["path"], tabSplitter); err != nil {
+				return fmt.Errorf("loading geonames cities: %w", err)
 			}
 
-			// Loop the map of fields after dupes have been removed (about 1/5th less... 2.6m vs 3.1m inreases lookup performance).
-			for _, fields := range maxMindCityDedupeIdx {
-				if fields[0] != "" && fields[0] != "0" {
-					if fields[2] != "AccentCity" {
-						pop, _ := strconv.Atoi(fields[4])
-						lat, _ := strconv.ParseFloat(fields[5], 64)
-						lng, _ := strconv.ParseFloat(fields[6], 64)
-						// MaxMind's data set is a bit dirty. I've seen city names surrounded by parenthesis in a few places.
-						cn := strings.Trim(string(fields[2]), " ")
-						cn = strings.Trim(cn, "( )")
-
-						// Don't take any city names with erroneous punctuation either.
-						if strings.Contains(cn, "!") || strings.Contains(cn, "@") {
-							continue
-						}
-
-						gh := geohash.Encode(lat, lng)
-						// This is produced with empty lat/lng values - don't store it.
-						if gh == "7zzzzzzzzzzz" {
-							gh = ""
-						}
-
-						// If the geohash was seen before...
-						_, ok := locationDedupeIdx[gh]
-						if !ok {
-							locationDedupeIdx[gh] = true
-
-							var c GeobedCity
-							c.City = cn
-							c.Country = toUpper(string(fields[0]))
-							c.Region = string(fields[3])
-							c.Latitude = lat
-							c.Longitude = lng
-							c.Population = int32(pop)
-							c.Geohash = gh
-
-							// Don't include entries without a city name. If we want to geocode the centers of countries and states, then we can do that faster through other means.
-							if len(c.City) > 0 && len(c.Country) > 0 {
-								g.c = append(g.c, c)
-							}
-						}
-					}
-				}
+		case "maxmindWorldCities":
+			if err := g.loadMaxMindCities(f["path"]); err != nil {
+				// MaxMind is optional, just log warning
+				log.Printf("warning: failed to load MaxMind cities: %v", err)
 			}
-			// Clear out the temrporary index (set to nil, it does get re-created) so that Go can garbage collect it at some point whenever it feels the need.
-			maxMindCityDedupeIdx = nil
-			locationDedupeIdx = nil
-		}
 
-		// ...And this one is just plain text
-		if f["id"] == "geonamesCountryInfo" {
-			fi, err := os.Open(f["path"])
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer fi.Close()
-
-			scanner := bufio.NewScanner(fi)
-			scanner.Split(bufio.ScanLines)
-
-			i := 1
-			for scanner.Scan() {
-				t := scanner.Text()
-				// There are a bunch of lines in this file that are comments, they start with #
-				if string(t[0]) != "#" {
-					i++
-					fields := regexp.MustCompile("\t").Split(t, 19)
-
-					if len(fields) == 19 {
-						if fields[0] != "" && fields[0] != "0" {
-							isoNumeric, _ := strconv.Atoi(fields[2])
-							area, _ := strconv.Atoi(fields[6])
-							pop, _ := strconv.Atoi(fields[7])
-							gid, _ := strconv.Atoi(fields[16])
-
-							var ci CountryInfo
-							ci.ISO = string(fields[0])
-							ci.ISO3 = string(fields[1])
-							ci.ISONumeric = int16(isoNumeric)
-							ci.Fips = string(fields[3])
-							ci.Country = string(fields[4])
-							ci.Capital = string(fields[5])
-							ci.Area = int32(area)
-							ci.Population = int32(pop)
-							ci.Continent = string(fields[8])
-							ci.Tld = string(fields[9])
-							ci.CurrencyCode = string(fields[10])
-							ci.CurrencyName = string(fields[11])
-							ci.Phone = string(fields[12])
-							ci.PostalCodeFormat = string(fields[13])
-							ci.PostalCodeRegex = string(fields[14])
-							ci.Languages = string(fields[15])
-							ci.GeonameId = int32(gid)
-							ci.Neighbours = string(fields[17])
-							ci.EquivalentFipsCode = string(fields[18])
-
-							g.co = append(g.co, ci)
-						}
-					}
-				}
+		case "geonamesCountryInfo":
+			if err := g.loadGeonamesCountryInfo(f["path"], tabSplitter); err != nil {
+				return fmt.Errorf("loading geonames country info: %w", err)
 			}
 		}
 	}
 
-	// Sort []GeobedCity by city names to help with binary search (the City field is the most searched upon field and the matching names can be easily filtered down from there).
+	// Sort cities by name for binary search optimization
 	sort.Sort(g.c)
 
-	// debug
-	// log.Println("TOTAL RECORDS:")
-	// log.Println(len(g.c))
-
-	// Index the locations of city names in the g.c []GeoCity slice. This way when searching the range can be limited so it will be faster.
-	cityNameIdx = make(map[string]int)
+	// Build city name index for faster range-based lookups
+	g.cityNameIdx = make(map[string]int)
 	for k, v := range g.c {
-		// Get the index key for the first character of the city name.
+		if len(v.City) == 0 {
+			continue
+		}
 		ik := toLower(string(v.City[0]))
-		if val, ok := cityNameIdx[ik]; ok {
-			// If this key number is greater than what was previously recorded, then set it as the new indexed key.
+		if val, ok := g.cityNameIdx[ik]; ok {
 			if val < k {
-				cityNameIdx[ik] = k
+				g.cityNameIdx[ik] = k
 			}
 		} else {
-			// If the index key has not yet been set for this value, then set it.
-			cityNameIdx[ik] = k
+			g.cityNameIdx[ik] = k
 		}
-
-		// Get the index key for the first two characters of the city name.
-		// if len(v.CityLower) >= 2 {
-		// 	ik2 := v.CityLower[0:2]
-		// 	if val, ok := cityNameIdx[ik2]; ok {
-		// 		// If this key number is greater than what was previously recorded, then set it as the new indexed key.
-		// 		if val < k {
-		// 			cityNameIdx[ik2] = k
-		// 		}
-		// 	} else {
-		// 		// If the index key has not yet been set for this value, then set it.
-		// 		cityNameIdx[ik2] = k
-		// 	}
-		// }
 	}
+
+	return nil
 }
 
-// Forward geocode, location string to lat/lng (returns a struct though)
+// loadGeonamesCities loads city data from the Geonames cities1000.zip file.
+func (g *GeoBed) loadGeonamesCities(path string, tabSplitter *regexp.Regexp) error {
+	rz, err := zip.OpenReader(path)
+	if err != nil {
+		return fmt.Errorf("opening zip file: %w", err)
+	}
+	defer rz.Close()
+
+	for _, uF := range rz.File {
+		fi, err := uF.Open()
+		if err != nil {
+			return fmt.Errorf("opening file in zip: %w", err)
+		}
+		defer fi.Close()
+
+		scanner := bufio.NewScanner(fi)
+		scanner.Split(bufio.ScanLines)
+
+		for scanner.Scan() {
+			fields := tabSplitter.Split(scanner.Text(), 19)
+			if len(fields) != 19 {
+				continue
+			}
+
+			lat, _ := strconv.ParseFloat(fields[4], 64)
+			lng, _ := strconv.ParseFloat(fields[5], 64)
+			pop, _ := strconv.Atoi(fields[14])
+
+			gh := geohash.Encode(lat, lng)
+			if gh == "7zzzzzzzzzzz" {
+				gh = ""
+			}
+
+			c := GeobedCity{
+				City:       strings.Trim(fields[1], " "),
+				CityAlt:    fields[3],
+				Country:    fields[8],
+				Region:     fields[10],
+				Latitude:   lat,
+				Longitude:  lng,
+				Population: int32(pop),
+				Geohash:    gh,
+			}
+
+			if len(c.City) > 0 {
+				g.c = append(g.c, c)
+			}
+		}
+	}
+
+	return nil
+}
+
+// loadMaxMindCities loads city data from the MaxMind worldcitiespop.txt.gz file.
+func (g *GeoBed) loadMaxMindCities(path string) error {
+	maxMindCityDedupeIdx = make(map[string][]string)
+
+	fi, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening file: %w", err)
+	}
+	defer fi.Close()
+
+	fz, err := gzip.NewReader(fi)
+	if err != nil {
+		return fmt.Errorf("creating gzip reader: %w", err)
+	}
+	defer fz.Close()
+
+	scanner := bufio.NewScanner(fz)
+	scanner.Split(bufio.ScanLines)
+
+	for scanner.Scan() {
+		t := scanner.Text()
+		fields := strings.Split(t, ",")
+		if len(fields) == 7 {
+			var b bytes.Buffer
+			b.WriteString(fields[0]) // country
+			b.WriteString(fields[3]) // region
+			b.WriteString(fields[1]) // city
+			maxMindCityDedupeIdx[b.String()] = fields
+		}
+	}
+
+	// Process deduplicated entries
+	for _, fields := range maxMindCityDedupeIdx {
+		if fields[0] == "" || fields[0] == "0" || fields[2] == "AccentCity" {
+			continue
+		}
+
+		pop, _ := strconv.Atoi(fields[4])
+		lat, _ := strconv.ParseFloat(fields[5], 64)
+		lng, _ := strconv.ParseFloat(fields[6], 64)
+
+		cn := strings.Trim(fields[2], " ")
+		cn = strings.Trim(cn, "( )")
+
+		if strings.Contains(cn, "!") || strings.Contains(cn, "@") {
+			continue
+		}
+
+		gh := geohash.Encode(lat, lng)
+		if gh == "7zzzzzzzzzzz" {
+			gh = ""
+		}
+
+		if _, ok := locationDedupeIdx[gh]; !ok {
+			locationDedupeIdx[gh] = true
+
+			c := GeobedCity{
+				City:       cn,
+				Country:    toUpper(fields[0]),
+				Region:     fields[3],
+				Latitude:   lat,
+				Longitude:  lng,
+				Population: int32(pop),
+				Geohash:    gh,
+			}
+
+			if len(c.City) > 0 && len(c.Country) > 0 {
+				g.c = append(g.c, c)
+			}
+		}
+	}
+
+	// Clear temporary indices for garbage collection
+	maxMindCityDedupeIdx = nil
+	locationDedupeIdx = nil
+
+	return nil
+}
+
+// loadGeonamesCountryInfo loads country metadata from the Geonames countryInfo.txt file.
+func (g *GeoBed) loadGeonamesCountryInfo(path string, tabSplitter *regexp.Regexp) error {
+	fi, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening file: %w", err)
+	}
+	defer fi.Close()
+
+	scanner := bufio.NewScanner(fi)
+	scanner.Split(bufio.ScanLines)
+
+	for scanner.Scan() {
+		t := scanner.Text()
+		// Skip empty lines and comments (lines starting with #)
+		if len(t) == 0 || t[0] == '#' {
+			continue
+		}
+
+		fields := tabSplitter.Split(t, 19)
+		if len(fields) != 19 || fields[0] == "" || fields[0] == "0" {
+			continue
+		}
+
+		isoNumeric, _ := strconv.Atoi(fields[2])
+		area, _ := strconv.Atoi(fields[6])
+		pop, _ := strconv.Atoi(fields[7])
+		gid, _ := strconv.Atoi(fields[16])
+
+		ci := CountryInfo{
+			ISO:                fields[0],
+			ISO3:               fields[1],
+			ISONumeric:         int16(isoNumeric),
+			Fips:               fields[3],
+			Country:            fields[4],
+			Capital:            fields[5],
+			Area:               int32(area),
+			Population:         int32(pop),
+			Continent:          fields[8],
+			Tld:                fields[9],
+			CurrencyCode:       fields[10],
+			CurrencyName:       fields[11],
+			Phone:              fields[12],
+			PostalCodeFormat:   fields[13],
+			PostalCodeRegex:    fields[14],
+			Languages:          fields[15],
+			GeonameId:          int32(gid),
+			Neighbours:         fields[17],
+			EquivalentFipsCode: fields[18],
+		}
+
+		g.co = append(g.co, ci)
+	}
+
+	return nil
+}
+
+// Geocode performs forward geocoding, converting a location string to coordinates.
+// It returns a GeobedCity with latitude/longitude and other location metadata.
+//
+// By default, fuzzy matching is used which returns a "best guess" result.
+// For stricter matching, pass GeocodeOptions{ExactCity: true}.
+//
+// Example:
+//
+//	city := g.Geocode("Austin, TX")
+//	fmt.Printf("%s: %.4f, %.4f\n", city.City, city.Latitude, city.Longitude)
 func (g *GeoBed) Geocode(n string, opts ...GeocodeOptions) GeobedCity {
 	var c GeobedCity
 	n = strings.TrimSpace(n)
@@ -635,30 +683,12 @@ func (g *GeoBed) fuzzyMatchLocation(n string) GeobedCity {
 		for _, v := range g.c[rng.f:rng.t] {
 			currentKey++
 
-			// Mainly useful for strings like: "Austin, TX" or "Austin TX" (locations with US state codes). Smile if your location string is this simple.
+			// Fast path for simple "City, ST" format queries
 			if nSt != "" {
 				if strings.EqualFold(n, v.City) && strings.EqualFold(nSt, v.Region) {
 					return v
 				}
 			}
-
-			// Special case. Airport codes and other short 3 letter abbreviations, ie. NYC and SFO
-			// Country codes could present problems here. It seems to work for NYC, but not SFO (which there are multiple SFOs actually).
-			// Leaving it for now, but airport codes are tricky (though they are popular on Twitter). These must be exact (case sensitive) matches.
-			// if len(n) == 3 {
-			// 	alts := strings.Split(v.CityAlt, ",")
-			// 	for _, altV := range alts {
-			// 		if altV != "" {
-			// 			if altV == n {
-			// 				if val, ok := bestMatchingKeys[currentKey]; ok {
-			// 					bestMatchingKeys[currentKey] = val + 4
-			// 				} else {
-			// 					bestMatchingKeys[currentKey] = 4
-			// 				}
-			// 			}
-			// 		}
-			// 	}
-			// }
 
 			// Abbreviations for state/country
 			// Region (state/province)
@@ -854,33 +884,27 @@ func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []st
 	return nCo, nSt, abbrevSlice, nSlice
 }
 
-// There's potentially 2.7 million items to range though, let's see if we can reduce that by taking slices of the slice in alphabetical order.
+// getSearchRange returns index ranges in the city slice to search based on the first
+// character of each piece in nSlice. This significantly reduces search space.
 func (g *GeoBed) getSearchRange(nSlice []string) []r {
-	// NOTE: A simple binary search was not helping here since we aren't looking for one specific thing. We have multiple elements, city, state, country.
-	// So we'd end up with multiple binary searches to piece together which could be quite a few exponentially given the possible combinations...And so it was slower.
-
 	ranges := []r{}
 	for _, ns := range nSlice {
 		ns = strings.TrimSuffix(ns, ",")
 
 		if len(ns) > 0 {
-			// Get the first character in the string, this tells us where to stop.
 			fc := toLower(string(ns[0]))
-			// Get the previous index key (by getting the previous character in the alphabet) to figure out where to start.
 			pik := string(prev(rune(fc[0])))
 
-			// To/from key
 			fk := 0
 			tk := 0
-			if val, ok := cityNameIdx[pik]; ok {
+			if val, ok := g.cityNameIdx[pik]; ok {
 				fk = val
 			}
-			if val, ok := cityNameIdx[fc]; ok {
+			if val, ok := g.cityNameIdx[fc]; ok {
 				tk = val
 			}
-			// Don't let the to key be out of range.
 			if tk == 0 {
-				tk = (len(g.c) - 1)
+				tk = len(g.c) - 1
 			}
 			ranges = append(ranges, r{fk, tk})
 		}
@@ -893,39 +917,39 @@ func prev(r rune) rune {
 	return r - 1
 }
 
-// Reverse geocode
+// ReverseGeocode performs reverse geocoding, converting latitude/longitude
+// coordinates to a city-level location.
+//
+// The algorithm uses geohash prefix matching to find the closest city.
+// When multiple cities match equally, the one with the highest population wins.
+//
+// Example:
+//
+//	city := g.ReverseGeocode(30.26715, -97.74306)
+//	fmt.Printf("%s, %s\n", city.City, city.Region) // Austin, TX
 func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
 	c := GeobedCity{}
 
 	gh := geohash.Encode(lat, lng)
-	// This is produced with empty lat/lng values - don't look for anything.
 	if gh == "7zzzzzzzzzzz" {
 		return c
 	}
 
-	// Note: All geohashes are going to be 12 characters long. Even if the precision on the lat/lng isn't great. The geohash package will center things.
-	// Obviously lat/lng like 37, -122 is a guess. That's no where near the resolution of a city. Though we're going to allow guesses.
 	mostMatched := 0
 	matched := 0
 	for k, v := range g.c {
-		// check first two characters to reduce the number of loops
+		if len(v.Geohash) < 2 {
+			continue
+		}
 		if v.Geohash[0] == gh[0] && v.Geohash[1] == gh[1] {
 			matched = 2
 			for i := 2; i <= len(gh); i++ {
-				// log.Println(gh[0:i])
 				if v.Geohash[0:i] == gh[0:i] {
 					matched++
 				}
 			}
-			// tie breakers go to city with larger population (NOTE: There's still a chance that the next pass will uncover a better match)
 			if matched == mostMatched && g.c[k].Population > c.Population {
 				c = g.c[k]
-				// log.Println("MATCHES")
-				// log.Println(matched)
-				// log.Println("CITY")
-				// log.Println(c.City)
-				// log.Println("POPULATION")
-				// log.Println(c.Population)
 			}
 			if matched > mostMatched {
 				c = g.c[k]
@@ -963,9 +987,8 @@ func toUpper(s string) string {
 	return string(b)
 }
 
-// Dumps the Geobed data to disk. This speeds up startup time on subsequent runs (or if calling NewGeobed() multiple times which should be avoided if possible).
-// TODO: Refactor
-func (g GeoBed) store() error {
+// store saves the Geobed data to disk for faster subsequent loads.
+func (g *GeoBed) store() error {
 	b := new(bytes.Buffer)
 
 	// Store the city info
@@ -1011,10 +1034,9 @@ func (g GeoBed) store() error {
 	}
 	log.Printf("%d bytes successfully written to cache file\n", n)
 
-	// Store the index info (again there's some repetition here)
+	// Store the index info
 	b.Reset()
-	// enc = gob.NewEncoder(b)
-	err = enc.Encode(cityNameIdx)
+	err = enc.Encode(g.cityNameIdx)
 	if err != nil {
 		b.Reset()
 		return err
@@ -1040,32 +1062,24 @@ func (g GeoBed) store() error {
 func openOptionallyCachedFile(file string) (fs.File, error) {
 	fh, err := cacheData.Open(file)
 	if err != nil {
-		fmt.Printf("failed to open cached %s (%v)\n", file, err)
-		fmt.Printf("trying to open local-fs %s\n", file)
+		// Try local filesystem
 		fh, err = os.Open(file)
 		if err != nil {
-			fmt.Printf("failed to open local-fs %s (%v)\n", file, err)
 			return nil, err
 		}
 	}
 	return fh, nil
 }
 
-// given a filename, looks for filename.bz2 and tries to return a
-// reader to it. If it doesn't find the compressed version, it looks
-// for the uncompressed version. (The go library doesn't have built-in
-// bzip2 compression, and the 3rd-party options look sketchy, so if
-// you want to download and store a new compressed snapshot, run the
-// binary, download the files, and compress them yourself.
+// openOptionallyBzippedFile looks for filename.bz2 first and returns a bzip2 reader.
+// If the compressed version isn't found, it falls back to the uncompressed version.
 func openOptionallyBzippedFile(file string) (io.Reader, error) {
 	fh, err := openOptionallyCachedFile(file + ".bz2")
 	if err != nil {
-		fmt.Printf("failed to open %s.bz2 (%v)\n", file, err)
-		fmt.Printf("trying to open %s\n", file)
+		// Try uncompressed version
 		fh, err = openOptionallyCachedFile(file)
-		if err == nil {
-			fmt.Printf("failed to open %s (%v)\n", file, err)
-			return nil, err
+		if err != nil {
+			return nil, fmt.Errorf("opening %s: %w", file, err)
 		}
 		return fh, nil
 	}
@@ -1103,16 +1117,15 @@ func loadGeobedCountryData() ([]CountryInfo, error) {
 	return co, nil
 }
 
-func loadGeobedCityNameIdx() error {
+func loadGeobedCityNameIdx() (map[string]int, error) {
 	fh, err := openOptionallyBzippedFile("geobed-cache/cityNameIdx.dmp")
 	if err != nil {
-		return err
+		return nil, err
 	}
+	idx := make(map[string]int)
 	dec := gob.NewDecoder(fh)
-	cityNameIdx = make(map[string]int)
-	err = dec.Decode(&cityNameIdx)
-	if err != nil {
-		return err
+	if err := dec.Decode(&idx); err != nil {
+		return nil, err
 	}
-	return nil
+	return idx, nil
 }
