@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agnivade/levenshtein"
 	"github.com/golang/geo/s2"
@@ -219,7 +220,26 @@ type Cities []GeobedCity
 
 func (c Cities) Len() int           { return len(c) }
 func (c Cities) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
-func (c Cities) Less(i, j int) bool { return toLower(c[i].City) < toLower(c[j].City) }
+func (c Cities) Less(i, j int) bool { return compareCaseInsensitive(c[i].City, c[j].City) < 0 }
+
+// compareCaseInsensitive compares two strings case-insensitively without allocation.
+// Returns negative if a < b, positive if a > b, zero if equal.
+func compareCaseInsensitive(a, b string) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		ca, cb := a[i], b[i]
+		// Convert to lowercase inline
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return int(ca) - int(cb)
+		}
+	}
+	return len(a) - len(b)
+}
 
 // GeobedCity represents a city with geocoding data.
 // Memory-optimized: uses indexes for Country/Region, float32 for coordinates.
@@ -342,9 +362,6 @@ func NewGeobed(opts ...Option) (*GeoBed, error) {
 		opt(cfg)
 	}
 
-	// Configure admin divisions data path before any use
-	setAdminDivisionsDataDir(cfg.DataDir)
-
 	g := &GeoBed{config: cfg}
 
 	// Initialize lookup tables (thread-safe, runs once)
@@ -443,8 +460,13 @@ func (g *GeoBed) downloadDataSets() error {
 	return nil
 }
 
+// httpClient is a shared HTTP client with reasonable timeouts.
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+}
+
 func downloadFile(url, path string) error {
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return fmt.Errorf("HTTP GET %s: %w", url, err)
 	}
@@ -470,13 +492,12 @@ func downloadFile(url, path string) error {
 // loadDataSets parses the raw data files and populates the GeoBed instance.
 func (g *GeoBed) loadDataSets() error {
 	locationDedupeIdx = make(map[string]bool)
-	tabSplitter := regexp.MustCompile("\t")
 
 	for _, f := range dataSetFiles {
 		localPath := g.config.DataDir + "/" + filepath.Base(f.Path)
 		switch f.ID {
 		case DataSourceGeonamesCities:
-			if err := g.loadGeonamesCities(localPath, tabSplitter); err != nil {
+			if err := g.loadGeonamesCities(localPath); err != nil {
 				return fmt.Errorf("loading geonames cities: %w", err)
 			}
 		case DataSourceMaxMindCities:
@@ -485,7 +506,7 @@ func (g *GeoBed) loadDataSets() error {
 				log.Printf("info: MaxMind cities not loaded (optional): %v", err)
 			}
 		case DataSourceGeonamesCountry:
-			if err := g.loadGeonamesCountryInfo(localPath, tabSplitter); err != nil {
+			if err := g.loadGeonamesCountryInfo(localPath); err != nil {
 				return fmt.Errorf("loading geonames country info: %w", err)
 			}
 		}
@@ -510,7 +531,7 @@ func (g *GeoBed) loadDataSets() error {
 	return nil
 }
 
-func (g *GeoBed) loadGeonamesCities(path string, tabSplitter *regexp.Regexp) error {
+func (g *GeoBed) loadGeonamesCities(path string) error {
 	rz, err := zip.OpenReader(path)
 	if err != nil {
 		return fmt.Errorf("opening zip file: %w", err)
@@ -528,7 +549,7 @@ func (g *GeoBed) loadGeonamesCities(path string, tabSplitter *regexp.Regexp) err
 		scanner.Split(bufio.ScanLines)
 
 		for scanner.Scan() {
-			fields := tabSplitter.Split(scanner.Text(), 19)
+			fields := strings.SplitN(scanner.Text(), "\t", 19)
 			if len(fields) != 19 {
 				continue
 			}
@@ -626,7 +647,7 @@ func (g *GeoBed) loadMaxMindCities(path string) error {
 	return nil
 }
 
-func (g *GeoBed) loadGeonamesCountryInfo(path string, tabSplitter *regexp.Regexp) error {
+func (g *GeoBed) loadGeonamesCountryInfo(path string) error {
 	fi, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening file: %w", err)
@@ -642,7 +663,7 @@ func (g *GeoBed) loadGeonamesCountryInfo(path string, tabSplitter *regexp.Regexp
 			continue
 		}
 
-		fields := tabSplitter.Split(t, 19)
+		fields := strings.SplitN(t, "\t", 19)
 		if len(fields) != 19 || fields[0] == "" || fields[0] == "0" {
 			continue
 		}
@@ -874,38 +895,116 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 	return g.Cities[bestMatchingKey]
 }
 
+// abbrevRegex is compiled once for extracting 2-3 character abbreviations.
+var abbrevRegex = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`[\S]{2,3}`)
+})
+
 func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []string) {
-	re := regexp.MustCompile(`[\S]{2,3}`)
-	abbrevSlice := re.FindStringSubmatch(n)
+	abbrevSlice := abbrevRegex().FindStringSubmatch(n)
 
 	nCo := ""
+	// Check for country names using string operations (safe, fast)
 	for _, co := range g.Countries {
-		re = regexp.MustCompile("(?i)^" + co.Country + ",?\\s|\\s" + co.Country + ",?\\s" + co.Country + "\\s$")
-		if re.MatchString(n) {
+		countryName := co.Country
+		countryNameLower := toLower(countryName)
+		nLower := toLower(n)
+
+		// Check exact match: "France"
+		if strings.EqualFold(n, countryName) {
 			nCo = co.ISO
-			n = re.ReplaceAllString(n, "")
+			n = ""
+			break
+		}
+
+		// Check prefix: "France, Paris" -> match "France, "
+		prefixWithComma := countryNameLower + ", "
+		if len(nLower) > len(prefixWithComma) && nLower[:len(prefixWithComma)] == prefixWithComma {
+			nCo = co.ISO
+			n = n[len(prefixWithComma):]
+			break
+		}
+		prefixWithSpace := countryNameLower + " "
+		if len(nLower) > len(prefixWithSpace) && nLower[:len(prefixWithSpace)] == prefixWithSpace {
+			nCo = co.ISO
+			n = n[len(prefixWithSpace):]
+			break
+		}
+
+		// Check suffix: "Paris, France" -> match ", France"
+		suffixWithComma := ", " + countryNameLower
+		if len(nLower) > len(suffixWithComma) && nLower[len(nLower)-len(suffixWithComma):] == suffixWithComma {
+			nCo = co.ISO
+			n = n[:len(n)-len(suffixWithComma)]
+			break
+		}
+		suffixWithSpace := " " + countryNameLower
+		if len(nLower) > len(suffixWithSpace) && nLower[len(nLower)-len(suffixWithSpace):] == suffixWithSpace {
+			nCo = co.ISO
+			n = n[:len(n)-len(suffixWithSpace)]
+			break
 		}
 	}
 
 	nSt := ""
-	// First check US state codes (most common case)
+	// Check US state codes using string operations (safe, fast)
 	for sc := range UsStateCodes {
-		re = regexp.MustCompile("(?i)^" + sc + ",?\\s|\\s" + sc + ",?\\s|\\s" + sc + "$")
-		if re.MatchString(n) {
+		scLower := toLower(sc)
+		nLower := toLower(n)
+
+		// Exact match: "TX"
+		if nLower == scLower {
 			nSt = sc
-			n = re.ReplaceAllString(n, "")
-			// If we matched a US state, set country to US if not already set
+			n = ""
 			if nCo == "" {
 				nCo = "US"
 			}
+			break
+		}
+
+		// Prefix: "TX, Austin" or "TX Austin"
+		prefixWithComma := scLower + ", "
+		if len(nLower) > len(prefixWithComma) && nLower[:len(prefixWithComma)] == prefixWithComma {
+			nSt = sc
+			n = n[len(prefixWithComma):]
+			if nCo == "" {
+				nCo = "US"
+			}
+			break
+		}
+		prefixWithSpace := scLower + " "
+		if len(nLower) > len(prefixWithSpace) && nLower[:len(prefixWithSpace)] == prefixWithSpace {
+			nSt = sc
+			n = n[len(prefixWithSpace):]
+			if nCo == "" {
+				nCo = "US"
+			}
+			break
+		}
+
+		// Suffix: "Austin, TX" or "Austin TX"
+		suffixWithComma := ", " + scLower
+		if len(nLower) > len(suffixWithComma) && nLower[len(nLower)-len(suffixWithComma):] == suffixWithComma {
+			nSt = sc
+			n = n[:len(n)-len(suffixWithComma)]
+			if nCo == "" {
+				nCo = "US"
+			}
+			break
+		}
+		suffixWithSpace := " " + scLower
+		if len(nLower) > len(suffixWithSpace) && nLower[len(nLower)-len(suffixWithSpace):] == suffixWithSpace {
+			nSt = sc
+			n = n[:len(n)-len(suffixWithSpace)]
+			if nCo == "" {
+				nCo = "US"
+			}
+			break
 		}
 	}
 
 	// If no US state matched, check international admin divisions
 	if nSt == "" {
-		// Load admin divisions (lazy, thread-safe)
-		loadAdminDivisions()
-
 		// Look for 2-3 letter codes at end of query that could be admin divisions
 		// Pattern: "Toronto, ON" or "Sydney NSW"
 		parts := strings.Split(n, " ")
@@ -914,12 +1013,12 @@ func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []st
 			if len(lastPart) >= 2 && len(lastPart) <= 3 {
 				lastPartUpper := toUpper(lastPart)
 				// If we know the country, check if it's a valid division for that country
-				if nCo != "" && isAdminDivision(nCo, lastPartUpper) {
+				if nCo != "" && g.isAdminDivision(nCo, lastPartUpper) {
 					nSt = lastPartUpper
 					n = strings.Join(parts[:len(parts)-1], " ")
 				} else if nCo == "" {
 					// Try to find an unambiguous admin division
-					if country := getAdminDivisionCountry(lastPartUpper); country != "" {
+					if country := g.getAdminDivisionCountry(lastPartUpper); country != "" {
 						nSt = lastPartUpper
 						nCo = country
 						n = strings.Join(parts[:len(parts)-1], " ")

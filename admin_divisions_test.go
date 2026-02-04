@@ -5,7 +5,8 @@ import (
 )
 
 func TestLoadAdminDivisions(t *testing.T) {
-	loadAdminDivisions()
+	// Load admin divisions from the default data directory
+	adminDivisions := loadAdminDivisionsForDir("./geobed-data")
 
 	// Check that we loaded some divisions
 	if len(adminDivisions) == 0 {
@@ -69,6 +70,11 @@ func TestLoadAdminDivisions(t *testing.T) {
 }
 
 func TestIsAdminDivision(t *testing.T) {
+	g, err := NewGeobed()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	tests := []struct {
 		country  string
 		division string
@@ -87,7 +93,7 @@ func TestIsAdminDivision(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.country+"_"+tc.division, func(t *testing.T) {
-			got := isAdminDivision(tc.country, tc.division)
+			got := g.isAdminDivision(tc.country, tc.division)
 			if got != tc.want {
 				t.Errorf("isAdminDivision(%q, %q) = %v, want %v", tc.country, tc.division, got, tc.want)
 			}
@@ -96,6 +102,11 @@ func TestIsAdminDivision(t *testing.T) {
 }
 
 func TestGetAdminDivisionCountry(t *testing.T) {
+	g, err := NewGeobed()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	tests := []struct {
 		code        string
 		wantCountry string
@@ -109,7 +120,7 @@ func TestGetAdminDivisionCountry(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.code, func(t *testing.T) {
-			got := getAdminDivisionCountry(tc.code)
+			got := g.getAdminDivisionCountry(tc.code)
 			if got != tc.wantCountry {
 				t.Errorf("getAdminDivisionCountry(%q) = %q, want %q", tc.code, got, tc.wantCountry)
 			}
@@ -118,6 +129,11 @@ func TestGetAdminDivisionCountry(t *testing.T) {
 }
 
 func TestGetAdminDivisionName(t *testing.T) {
+	g, err := NewGeobed()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	tests := []struct {
 		country  string
 		division string
@@ -131,7 +147,7 @@ func TestGetAdminDivisionName(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.country+"_"+tc.division, func(t *testing.T) {
-			got := getAdminDivisionName(tc.country, tc.division)
+			got := g.getAdminDivisionName(tc.country, tc.division)
 			if got != tc.wantName {
 				t.Errorf("getAdminDivisionName(%q, %q) = %q, want %q", tc.country, tc.division, got, tc.wantName)
 			}
@@ -174,17 +190,22 @@ func TestInternationalAdminDivisions(t *testing.T) {
 }
 
 func TestAmbiguousAdminDivisionCodes(t *testing.T) {
-	// Numeric codes like "01", "02", "08" exist in many countries
+	g, err := NewGeobed()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Numeric codes like "01", "02", "03", "08" exist in many countries
 	// getAdminDivisionCountry should return empty for ambiguous codes
 
 	ambiguousCodes := []string{"01", "02", "03", "08"}
 	for _, code := range ambiguousCodes {
 		t.Run(code, func(t *testing.T) {
-			result := getAdminDivisionCountry(code)
+			result := g.getAdminDivisionCountry(code)
 			if result != "" {
 				// Count how many countries have this code
 				count := 0
-				loadAdminDivisions()
+				adminDivisions := loadAdminDivisionsForDir(g.config.DataDir)
 				for _, divs := range adminDivisions {
 					if _, ok := divs[code]; ok {
 						count++
