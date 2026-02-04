@@ -1383,14 +1383,16 @@ func (g *GeoBed) store() error {
 }
 
 func openOptionallyCachedFile(file string) (fs.File, error) {
-	fh, err := cacheData.Open(file)
-	if err != nil {
-		fh, err = os.Open(file)
-		if err != nil {
-			return nil, err
-		}
+	// WHY FILESYSTEM FIRST: When regenerating cache via RegenerateCache(),
+	// newly written .dmp files need to be validated. If we check embedded
+	// data first, ValidateCache() would verify the OLD embedded data instead
+	// of the fresh files, giving false positive validation results.
+	// This allows filesystem to override embedded data for testing and updates.
+	if fh, err := os.Open(file); err == nil {
+		return fh, nil
 	}
-	return fh, nil
+	// Fallback to embedded data (normal runtime case)
+	return cacheData.Open(file)
 }
 
 func openOptionallyBzippedFile(file string) (io.Reader, error) {
