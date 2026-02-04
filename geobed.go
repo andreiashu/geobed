@@ -851,6 +851,99 @@ func RegenerateCache() error {
 	return nil
 }
 
+// Validation thresholds for data integrity checks.
+// Based on Geonames cities1000.zip dataset (~145K cities with pop > 1000).
+const (
+	minCityCount    = 140000 // Expect at least 140K cities from Geonames
+	minCountryCount = 200    // Expect at least 200 countries
+)
+
+// validationCity defines a known city for functional validation.
+type validationCity struct {
+	query       string
+	wantCity    string
+	wantCountry string
+}
+
+// validationCoord defines known coordinates for reverse geocoding validation.
+type validationCoord struct {
+	lat, lng    float64
+	wantCity    string
+	wantCountry string
+}
+
+// knownCities are used to validate forward geocoding works correctly.
+// These are chosen to be unambiguous and match actual geocoder behavior.
+var knownCities = []validationCity{
+	{"Austin", "Austin", "US"},
+	{"Paris", "Paris", "FR"},
+	{"Sydney", "Sydney", "AU"},
+	{"Berlin", "Berlin", "DE"},
+	{"New York, NY", "New York City", "US"},
+	{"Tokyo", "Tokyo", "JP"},
+}
+
+// knownCoords are used to validate reverse geocoding works correctly.
+// Coordinates are chosen to be near city centers for reliable matching.
+var knownCoords = []validationCoord{
+	{30.26715, -97.74306, "Austin", "US"},     // Austin, TX (from existing tests)
+	{37.44651, -122.15322, "Palo Alto", "US"}, // Palo Alto, CA (from existing tests)
+	{36.9741, -122.0308, "Santa Cruz", "US"},  // Santa Cruz, CA (from existing tests)
+	{-33.8688, 151.2093, "Sydney", "AU"},      // Sydney
+}
+
+// ValidateCache loads the cache and performs integrity and functional checks.
+// Returns an error if validation fails.
+func ValidateCache() error {
+	// Load from cache (this tests that cache files are readable)
+	g, err := NewGeobed()
+	if err != nil {
+		return fmt.Errorf("failed to load cache: %w", err)
+	}
+
+	// Check city count
+	cityCount := len(g.c)
+	if cityCount < minCityCount {
+		return fmt.Errorf("city count too low: got %d, want >= %d", cityCount, minCityCount)
+	}
+	fmt.Printf("      City count: %d (OK)\n", cityCount)
+
+	// Check country count
+	countryCount := len(g.co)
+	if countryCount < minCountryCount {
+		return fmt.Errorf("country count too low: got %d, want >= %d", countryCount, minCountryCount)
+	}
+	fmt.Printf("      Country count: %d (OK)\n", countryCount)
+
+	// Validate forward geocoding
+	fmt.Printf("      Forward geocoding: ")
+	for _, tc := range knownCities {
+		result := g.Geocode(tc.query)
+		if result.City != tc.wantCity {
+			return fmt.Errorf("geocode(%q) = %q, want %q", tc.query, result.City, tc.wantCity)
+		}
+		if result.Country() != tc.wantCountry {
+			return fmt.Errorf("geocode(%q) country = %q, want %q", tc.query, result.Country(), tc.wantCountry)
+		}
+	}
+	fmt.Printf("%d cities OK\n", len(knownCities))
+
+	// Validate reverse geocoding
+	fmt.Printf("      Reverse geocoding: ")
+	for _, tc := range knownCoords {
+		result := g.ReverseGeocode(tc.lat, tc.lng)
+		if result.City != tc.wantCity {
+			return fmt.Errorf("reverseGeocode(%v, %v) = %q, want %q", tc.lat, tc.lng, result.City, tc.wantCity)
+		}
+		if result.Country() != tc.wantCountry {
+			return fmt.Errorf("reverseGeocode(%v, %v) country = %q, want %q", tc.lat, tc.lng, result.Country(), tc.wantCountry)
+		}
+	}
+	fmt.Printf("%d coords OK\n", len(knownCoords))
+
+	return nil
+}
+
 // store saves the Geobed data to disk cache.
 func (g *GeoBed) store() error {
 	if err := os.MkdirAll("./geobed-cache", 0777); err != nil {

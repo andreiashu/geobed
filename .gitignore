@@ -1,3 +1,14 @@
 geobed.db
 coverage.out
 cover.sh
+
+# Cache files (only commit compressed .bz2 versions)
+geobed-cache/*.dmp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

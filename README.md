@@ -7,7 +7,7 @@ A high-performance, offline geocoding library for Go. Geocode city names to coor
 - **Offline**: All data embedded in the binary - no network requests after import
 - **Fast reverse geocoding**: S2 spatial index delivers ~8μs per query (~150,000 queries/sec)
 - **Forward geocoding**: Fuzzy matching with scoring for city name lookups
-- **2.38 million cities**: Comprehensive global coverage from Geonames dataset
+- **165K cities**: Cities with population > 1000 from Geonames dataset
 - **Thread-safe**: Safe for concurrent use from multiple goroutines
 - **Zero configuration**: Works out of the box with `NewGeobed()`
 
@@ -117,10 +117,10 @@ Benchmarked on Apple M1. Forward geocoding is slower due to fuzzy string matchin
 
 ## Memory Usage
 
-- **Runtime memory**: ~218MB
-- **Binary size**: ~56MB (embedded compressed data)
+- **Runtime memory**: ~57MB
+- **Binary size**: ~7MB (embedded compressed data)
 
-The library loads all city data into memory on initialization. This enables fast lookups but requires adequate RAM.
+The library loads all city data into memory on initialization. This enables fast lookups with minimal memory overhead.
 
 ## How It Works
 
@@ -148,7 +148,7 @@ City data comes from [Geonames](http://download.geonames.org/export/dump):
 - `cities1000.zip`: Cities with population > 1000
 - `countryInfo.txt`: Country metadata
 
-Data snapshot: August 2023
+Data snapshot: February 2026
 
 ### Updating the Data
 

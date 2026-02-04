@@ -15,7 +15,7 @@ func TestNewYorkGeocoding(t *testing.T) {
 		wantCity string
 		wantState string
 	}{
-		{"New York", "New York", "NY"},
+		{"New York", "New York City", "NY"},    // Resolves to NYC
 		{"New York, NY", "New York City", "NY"},
 		{"New York City", "New York City", "NY"},
 		{"Austin, TX", "Austin", "TX"},
