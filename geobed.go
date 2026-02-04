@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"regexp"
@@ -22,6 +23,7 @@ import (
 	"sync"
 
 	geohash "github.com/TomiHiltunen/geohash-golang"
+	"github.com/golang/geo/s2"
 )
 
 // Below is the original header comment. This fork of the geobed
@@ -125,6 +127,11 @@ var UsSateCodes = map[string]string{
 	"AP": "Armed Forces Pacific",
 }
 
+// s2CellLevel determines the granularity of the spatial index.
+// Level 10 gives ~10km cells, which is a good balance between
+// index size and query performance.
+const s2CellLevel = 10
+
 // GeoBed provides offline geocoding capabilities using embedded city data.
 // It supports both forward geocoding (location name to coordinates) and reverse
 // geocoding (coordinates to location information).
@@ -134,7 +141,8 @@ var UsSateCodes = map[string]string{
 type GeoBed struct {
 	c           Cities
 	co          []CountryInfo
-	cityNameIdx map[string]int // index of city name first characters to slice positions
+	cityNameIdx map[string]int        // index of city name first characters to slice positions
+	cellIndex   map[s2.CellID][]int   // S2 cell spatial index for fast reverse geocoding
 }
 
 type Cities []GeobedCity
@@ -266,7 +274,50 @@ func NewGeobed() (*GeoBed, error) {
 		}
 	}
 
+	// Build spatial index for fast reverse geocoding
+	g.buildCellIndex()
+
 	return g, nil
+}
+
+// buildCellIndex creates an S2 cell-based spatial index for fast reverse geocoding.
+// Each city is indexed by its S2 cell at the configured level (~10km cells).
+func (g *GeoBed) buildCellIndex() {
+	g.cellIndex = make(map[s2.CellID][]int)
+	for i, city := range g.c {
+		ll := s2.LatLngFromDegrees(city.Latitude, city.Longitude)
+		cell := s2.CellIDFromLatLng(ll).Parent(s2CellLevel)
+		g.cellIndex[cell] = append(g.cellIndex[cell], i)
+	}
+}
+
+// cellAndNeighbors returns the given cell plus its 8 neighboring cells.
+// This ensures we find the closest city even if it's in an adjacent cell.
+func (g *GeoBed) cellAndNeighbors(cell s2.CellID) []s2.CellID {
+	cells := make([]s2.CellID, 0, 9)
+	cells = append(cells, cell)
+
+	// Add the 4 edge neighbors
+	edgeNeighbors := cell.EdgeNeighbors()
+	for i := 0; i < 4; i++ {
+		cells = append(cells, edgeNeighbors[i])
+	}
+
+	// Add corner neighbors (neighbors of edge neighbors that aren't already included)
+	seen := make(map[s2.CellID]bool)
+	for _, c := range cells {
+		seen[c] = true
+	}
+	for i := 0; i < 4; i++ {
+		for _, corner := range edgeNeighbors[i].EdgeNeighbors() {
+			if !seen[corner] {
+				cells = append(cells, corner)
+				seen[corner] = true
+			}
+		}
+	}
+
+	return cells
 }
 
 // downloadDataSets downloads the raw data files if they don't exist locally.
@@ -920,45 +971,45 @@ func prev(r rune) rune {
 // ReverseGeocode performs reverse geocoding, converting latitude/longitude
 // coordinates to a city-level location.
 //
-// The algorithm uses geohash prefix matching to find the closest city.
-// When multiple cities match equally, the one with the highest population wins.
+// The algorithm uses S2 cell-based spatial indexing to efficiently find
+// the closest city. Only cities in the query cell and its neighbors are
+// checked, making this O(k) where k is typically 100-500 cities instead
+// of O(n) for all 2.7M+ cities.
 //
 // Example:
 //
 //	city := g.ReverseGeocode(30.26715, -97.74306)
 //	fmt.Printf("%s, %s\n", city.City, city.Region) // Austin, TX
 func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
-	c := GeobedCity{}
+	queryLL := s2.LatLngFromDegrees(lat, lng)
+	queryCell := s2.CellIDFromLatLng(queryLL).Parent(s2CellLevel)
 
-	gh := geohash.Encode(lat, lng)
-	if gh == "7zzzzzzzzzzz" {
-		return c
-	}
+	var closest GeobedCity
+	minDist := math.MaxFloat64
 
-	mostMatched := 0
-	matched := 0
-	for k, v := range g.c {
-		if len(v.Geohash) < 2 {
+	// Check the query cell and all neighboring cells
+	for _, cell := range g.cellAndNeighbors(queryCell) {
+		indices, ok := g.cellIndex[cell]
+		if !ok {
 			continue
 		}
-		if v.Geohash[0] == gh[0] && v.Geohash[1] == gh[1] {
-			matched = 2
-			for i := 2; i <= len(gh); i++ {
-				if v.Geohash[0:i] == gh[0:i] {
-					matched++
-				}
-			}
-			if matched == mostMatched && g.c[k].Population > c.Population {
-				c = g.c[k]
-			}
-			if matched > mostMatched {
-				c = g.c[k]
-				mostMatched = matched
+
+		for _, idx := range indices {
+			city := g.c[idx]
+			cityLL := s2.LatLngFromDegrees(city.Latitude, city.Longitude)
+			dist := float64(queryLL.Distance(cityLL))
+
+			if dist < minDist {
+				minDist = dist
+				closest = city
+			} else if dist == minDist && city.Population > closest.Population {
+				// Tie-breaker: prefer higher population
+				closest = city
 			}
 		}
 	}
 
-	return c
+	return closest
 }
 
 // A slightly faster lowercase function.

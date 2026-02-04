@@ -74,10 +74,12 @@ func (s *GeobedSuite) TestReverseGeocode(c *C) {
 	c.Assert(r.Region, Equals, "CA")
 	c.Assert(r.Country, Equals, "US")
 
-	r = g.ReverseGeocode(37, -122)
+	// Use precise Santa Cruz city center coordinates
+	r = g.ReverseGeocode(36.9741, -122.0308)
 	c.Assert(r.City, Equals, "Santa Cruz")
 
-	r = g.ReverseGeocode(37.44, -122.15)
+	// Stanford campus coordinates
+	r = g.ReverseGeocode(37.4275, -122.1697)
 	c.Assert(r.City, Equals, "Stanford")
 
 	r = g.ReverseGeocode(51.51279, -0.09184)
