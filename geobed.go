@@ -32,6 +32,7 @@ var cacheData embed.FS
 var dataSetFiles = []map[string]string{
 	{"url": "http://download.geonames.org/export/dump/cities1000.zip", "path": "./geobed-data/cities1000.zip", "id": "geonamesCities1000"},
 	{"url": "http://download.geonames.org/export/dump/countryInfo.txt", "path": "./geobed-data/countryInfo.txt", "id": "geonamesCountryInfo"},
+	{"url": "http://download.geonames.org/export/dump/admin1CodesASCII.txt", "path": "./geobed-data/admin1CodesASCII.txt", "id": "geonamesAdmin1Codes"},
 }
 
 // UsStateCodes maps US state abbreviations to full names.
