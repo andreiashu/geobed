@@ -827,9 +827,9 @@ func NewGeobed() (*GeoBed, error) { ... }
 | **P3** | Remove commented code | Maintainability | Low | Code Quality | ✅ Done |
 | **P3** | Type-safe data sources | Maintainability | Low | Code Quality | 🔲 Pending |
 | **P3** | Configurable paths | Flexibility | Low | Code Quality | 🔲 Pending |
-| **P3** | Comprehensive tests | Reliability | Medium | Testing | 🔲 Pending |
-| **P4** | Fuzzy matching (Levenshtein) | Feature | Medium | Design | 🔲 Pending |
-| **P4** | International admin divisions | Feature | High | Design | 🔲 Pending |
+| **P3** | Comprehensive tests | Reliability | Medium | Testing | ✅ Done |
+| **P4** | Fuzzy matching (Levenshtein) | Feature | Medium | Design | ✅ Done |
+| **P4** | International admin divisions | Feature | High | Design | ✅ Done |
 | **P4** | Data update mechanism | Freshness | Medium | Operational | ✅ Done |
 
 ---
@@ -855,10 +855,12 @@ func NewGeobed() (*GeoBed, error) { ... }
 3. ✅ Fix off-by-one geocoding bug (commit `f775f77`) — **"New York, NY" now works**
 4. ⏭️ String interning — abandoned (tested, didn't help due to Go string header overhead)
 
-### Phase 4: Polish (Week 5+)
-1. 🔲 Add comprehensive test cases
-2. 🔲 Implement configurable paths
-3. ✅ Add data update tooling (Makefile + cmd/update-cache)
+### Phase 4: Polish ✅ COMPLETE
+1. ✅ Add comprehensive test cases (commit `e8d982f`) — edge cases, unicode, concurrency
+2. ✅ Fuzzy matching with Levenshtein (commit `18ffe3f`) — typo tolerance
+3. ✅ International admin divisions (commits `e35222b`, `d6bdf1f`) — non-US region support
+4. ✅ Add data update tooling (Makefile + cmd/update-cache)
+5. 🔲 Implement configurable paths (optional, low priority)
 
 ---
 
