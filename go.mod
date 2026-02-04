@@ -1,4 +1,4 @@
-module github.com/jvmatl/geobed
+module github.com/andreiashu/geobed
 
 go 1.23.0
 
