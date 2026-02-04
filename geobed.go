@@ -626,10 +626,8 @@ func (g *GeoBed) fuzzyMatchLocation(n string) GeobedCity {
 	bestMatchingKey := 0
 
 	for _, rng := range ranges {
-		currentKey := rng.f
-
-		for _, v := range g.c[rng.f:rng.t] {
-			currentKey++
+		for i, v := range g.c[rng.f:rng.t] {
+			currentKey := rng.f + i // Correct index into g.c
 			vCountry := v.Country()
 			vRegion := v.Region()
 
