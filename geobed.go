@@ -825,6 +825,32 @@ func toUpper(s string) string {
 	return string(b)
 }
 
+// RegenerateCache forces a reload from raw data files and regenerates the cache.
+// This is useful for updating the embedded cache after downloading fresh data.
+// The raw data files must exist in ./geobed-data/ before calling this function.
+//
+// After running, compress the cache files with bzip2:
+//
+//	bzip2 -f geobed-cache/*.dmp
+func RegenerateCache() error {
+	g := &GeoBed{}
+
+	// Initialize lookup tables
+	lookupOnce.Do(initLookupTables)
+
+	// Load from raw data files (skip cache)
+	if err := g.loadDataSets(); err != nil {
+		return fmt.Errorf("failed to load data sets: %w", err)
+	}
+
+	// Store to cache
+	if err := g.store(); err != nil {
+		return fmt.Errorf("failed to store cache: %w", err)
+	}
+
+	return nil
+}
+
 // store saves the Geobed data to disk cache.
 func (g *GeoBed) store() error {
 	if err := os.MkdirAll("./geobed-cache", 0777); err != nil {

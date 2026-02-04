@@ -830,7 +830,7 @@ func NewGeobed() (*GeoBed, error) { ... }
 | **P3** | Comprehensive tests | Reliability | Medium | Testing | 🔲 Pending |
 | **P4** | Fuzzy matching (Levenshtein) | Feature | Medium | Design | 🔲 Pending |
 | **P4** | International admin divisions | Feature | High | Design | 🔲 Pending |
-| **P4** | Data update mechanism | Freshness | Medium | Operational | 🔲 Pending |
+| **P4** | Data update mechanism | Freshness | Medium | Operational | ✅ Done |
 
 ---
 
@@ -858,7 +858,7 @@ func NewGeobed() (*GeoBed, error) { ... }
 ### Phase 4: Polish (Week 5+)
 1. 🔲 Add comprehensive test cases
 2. 🔲 Implement configurable paths
-3. 🔲 Add data update tooling
+3. ✅ Add data update tooling (Makefile + cmd/update-cache)
 
 ---
 

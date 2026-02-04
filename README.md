@@ -145,10 +145,25 @@ This achieves O(k) complexity where k ≈ 100-500 cities, compared to O(n) for n
 ## Data Sources
 
 City data comes from [Geonames](http://download.geonames.org/export/dump):
-- `cities500.txt`: Cities with population > 500
+- `cities1000.zip`: Cities with population > 1000
 - `countryInfo.txt`: Country metadata
 
 Data snapshot: August 2023
+
+### Updating the Data
+
+To refresh the embedded data with the latest from Geonames:
+
+```bash
+# Download fresh data and regenerate cache
+make update-data
+
+# Commit the updated files
+git add geobed-data geobed-cache
+git commit -m "Update Geonames data to $(date +%Y-%m)"
+```
+
+Geonames updates their data daily around 3AM CET.
 
 ## Limitations
 
