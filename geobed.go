@@ -314,6 +314,10 @@ var (
 	locationDedupeIdx    map[string]bool
 )
 
+// downloadMu protects data file downloads and cache generation from race conditions.
+// Without this, concurrent NewGeobed() calls when cache is missing could corrupt files.
+var downloadMu sync.Mutex
+
 // Singleton pattern for default GeoBed instance.
 var (
 	defaultGeobed     *GeoBed
@@ -466,7 +470,13 @@ func (g *GeoBed) cellAndNeighbors(cell s2.CellID) []s2.CellID {
 }
 
 // downloadDataSets downloads the raw data files if they don't exist locally.
+// Thread-safe: uses mutex to prevent race conditions when multiple goroutines
+// call NewGeobed() concurrently with missing cache files.
 func (g *GeoBed) downloadDataSets() error {
+	// Acquire lock to prevent concurrent downloads that could corrupt files
+	downloadMu.Lock()
+	defer downloadMu.Unlock()
+
 	// WHY 0755: Using restrictive permissions (rwxr-xr-x) instead of world-writable (0777)
 	// to prevent security issues (CWE-732) in shared environments like Kubernetes or
 	// multi-user servers where other users could inject malicious data files.
@@ -476,6 +486,7 @@ func (g *GeoBed) downloadDataSets() error {
 
 	for _, f := range dataSetFiles {
 		localPath := g.config.DataDir + "/" + filepath.Base(f.Path)
+		// Re-check existence inside lock (another goroutine may have downloaded)
 		if _, err := os.Stat(localPath); err == nil {
 			continue
 		}
@@ -580,9 +591,16 @@ func (g *GeoBed) loadGeonamesCities(path string) error {
 				continue
 			}
 
-			lat, _ := strconv.ParseFloat(fields[4], 32)
-			lng, _ := strconv.ParseFloat(fields[5], 32)
-			pop, _ := strconv.Atoi(fields[14])
+			// Parse coordinates with error handling to avoid "Null Island" (0,0) entries
+			// from malformed data. Skip records with invalid coordinates.
+			lat, errLat := strconv.ParseFloat(fields[4], 32)
+			lng, errLng := strconv.ParseFloat(fields[5], 32)
+			if errLat != nil || errLng != nil {
+				// Skip records with unparseable coordinates rather than
+				// storing them at (0,0) which would be incorrect
+				continue
+			}
+			pop, _ := strconv.Atoi(fields[14]) // Population of 0 is acceptable
 
 			c := GeobedCity{
 				City:       strings.Trim(fields[1], " "),
@@ -638,8 +656,12 @@ func (g *GeoBed) loadMaxMindCities(path string) error {
 		}
 
 		pop, _ := strconv.Atoi(fields[4])
-		lat, _ := strconv.ParseFloat(fields[5], 32)
-		lng, _ := strconv.ParseFloat(fields[6], 32)
+		// Parse coordinates with error handling to avoid "Null Island" (0,0) entries
+		lat, errLat := strconv.ParseFloat(fields[5], 32)
+		lng, errLng := strconv.ParseFloat(fields[6], 32)
+		if errLat != nil || errLng != nil {
+			continue // Skip records with unparseable coordinates
+		}
 
 		cn := strings.Trim(fields[2], " ")
 		cn = strings.Trim(cn, "( )")
