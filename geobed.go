@@ -576,45 +576,58 @@ func (g *GeoBed) loadGeonamesCities(path string) error {
 	defer rz.Close()
 
 	for _, uF := range rz.File {
-		fi, err := uF.Open()
-		if err != nil {
-			return fmt.Errorf("opening file in zip: %w", err)
+		// NOTE: This is NOT vulnerable to Zip Slip (CWE-22) because we're only
+		// READING the zip content into memory via bufio.Scanner - we never
+		// extract files to disk. The uF.Open() returns an io.ReadCloser for
+		// streaming the compressed content, not a file path.
+		if err := g.processZipEntry(uF); err != nil {
+			return err
 		}
-		defer fi.Close()
+	}
+	return nil
+}
 
-		scanner := bufio.NewScanner(fi)
-		scanner.Split(bufio.ScanLines)
+// processZipEntry reads a single file entry from a zip archive.
+// Extracted to avoid defer-in-loop anti-pattern.
+func (g *GeoBed) processZipEntry(uF *zip.File) error {
+	fi, err := uF.Open()
+	if err != nil {
+		return fmt.Errorf("opening file in zip: %w", err)
+	}
+	defer fi.Close()
 
-		for scanner.Scan() {
-			fields := strings.SplitN(scanner.Text(), "\t", 19)
-			if len(fields) != 19 {
-				continue
-			}
+	scanner := bufio.NewScanner(fi)
+	scanner.Split(bufio.ScanLines)
 
-			// Parse coordinates with error handling to avoid "Null Island" (0,0) entries
-			// from malformed data. Skip records with invalid coordinates.
-			lat, errLat := strconv.ParseFloat(fields[4], 32)
-			lng, errLng := strconv.ParseFloat(fields[5], 32)
-			if errLat != nil || errLng != nil {
-				// Skip records with unparseable coordinates rather than
-				// storing them at (0,0) which would be incorrect
-				continue
-			}
-			pop, _ := strconv.Atoi(fields[14]) // Population of 0 is acceptable
+	for scanner.Scan() {
+		fields := strings.SplitN(scanner.Text(), "\t", 19)
+		if len(fields) != 19 {
+			continue
+		}
 
-			c := GeobedCity{
-				City:       strings.Trim(fields[1], " "),
-				CityAlt:    fields[3],
-				country:    internCountry(fields[8]),
-				region:     internRegion(fields[10]),
-				Latitude:   float32(lat),
-				Longitude:  float32(lng),
-				Population: int32(pop),
-			}
+		// Parse coordinates with error handling to avoid "Null Island" (0,0) entries
+		// from malformed data. Skip records with invalid coordinates.
+		lat, errLat := strconv.ParseFloat(fields[4], 32)
+		lng, errLng := strconv.ParseFloat(fields[5], 32)
+		if errLat != nil || errLng != nil {
+			// Skip records with unparseable coordinates rather than
+			// storing them at (0,0) which would be incorrect
+			continue
+		}
+		pop, _ := strconv.Atoi(fields[14]) // Population of 0 is acceptable
 
-			if len(c.City) > 0 {
-				g.Cities = append(g.Cities, c)
-			}
+		c := GeobedCity{
+			City:       strings.Trim(fields[1], " "),
+			CityAlt:    fields[3],
+			country:    internCountry(fields[8]),
+			region:     internRegion(fields[10]),
+			Latitude:   float32(lat),
+			Longitude:  float32(lng),
+			Population: int32(pop),
+		}
+
+		if len(c.City) > 0 {
+			g.Cities = append(g.Cities, c)
 		}
 	}
 	return nil
