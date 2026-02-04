@@ -556,7 +556,15 @@ func (g *GeoBed) loadDataSets() error {
 		if len(v.City) == 0 {
 			continue
 		}
-		ik := toLower(string(v.City[0]))
+		// Use rune (Unicode character) for indexing to handle multi-byte UTF-8
+		// characters correctly. This matches the search logic in getSearchRange.
+		// Without this, cities like "Åland" or "Örebro" would be indexed by their
+		// first UTF-8 byte (0xC3) instead of their actual first character.
+		runes := []rune(v.City)
+		if len(runes) == 0 {
+			continue
+		}
+		ik := toLower(string(runes[0]))
 		if val, ok := g.cityNameIdx[ik]; ok {
 			if val < k {
 				g.cityNameIdx[ik] = k
