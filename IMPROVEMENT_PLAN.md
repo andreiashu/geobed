@@ -825,8 +825,7 @@ func NewGeobed() (*GeoBed, error) { ... }
 | **P2** | Off-by-one geocoding bug | Correctness | Low | Critical | ✅ Done |
 | **P2** | API documentation | Usability | Medium | Docs | ✅ Done |
 | **P3** | Remove commented code | Maintainability | Low | Code Quality | ✅ Done |
-| **P3** | Type-safe data sources | Maintainability | Low | Code Quality | 🔲 Pending |
-| **P3** | Configurable paths | Flexibility | Low | Code Quality | 🔲 Pending |
+| **P3** | Type-safe data sources | Maintainability | Low | Code Quality | ✅ Done |
 | **P3** | Comprehensive tests | Reliability | Medium | Testing | ✅ Done |
 | **P4** | Fuzzy matching (Levenshtein) | Feature | Medium | Design | ✅ Done |
 | **P4** | International admin divisions | Feature | High | Design | ✅ Done |
@@ -860,7 +859,7 @@ func NewGeobed() (*GeoBed, error) { ... }
 2. ✅ Fuzzy matching with Levenshtein (commit `18ffe3f`) — typo tolerance
 3. ✅ International admin divisions (commits `e35222b`, `d6bdf1f`) — non-US region support
 4. ✅ Add data update tooling (Makefile + cmd/update-cache)
-5. 🔲 Implement configurable paths (optional, low priority)
+5. ✅ Type-safe data sources — replaced map[string]string with typed DataSource struct
 
 ---
 

@@ -29,11 +29,28 @@ import (
 //go:embed geobed-cache
 var cacheData embed.FS
 
+// DataSourceID identifies a data source type.
+type DataSourceID string
+
+const (
+	DataSourceGeonamesCities   DataSourceID = "geonamesCities1000"
+	DataSourceGeonamesCountry  DataSourceID = "geonamesCountryInfo"
+	DataSourceGeonamesAdmin1   DataSourceID = "geonamesAdmin1Codes"
+	DataSourceMaxMindCities    DataSourceID = "maxmindWorldCities"
+)
+
+// DataSource defines a data source for geocoding data.
+type DataSource struct {
+	URL  string       // Download URL
+	Path string       // Local file path
+	ID   DataSourceID // Identifier for processing logic
+}
+
 // dataSetFiles defines the data sources for geocoding data.
-var dataSetFiles = []map[string]string{
-	{"url": "http://download.geonames.org/export/dump/cities1000.zip", "path": "./geobed-data/cities1000.zip", "id": "geonamesCities1000"},
-	{"url": "http://download.geonames.org/export/dump/countryInfo.txt", "path": "./geobed-data/countryInfo.txt", "id": "geonamesCountryInfo"},
-	{"url": "http://download.geonames.org/export/dump/admin1CodesASCII.txt", "path": "./geobed-data/admin1CodesASCII.txt", "id": "geonamesAdmin1Codes"},
+var dataSetFiles = []DataSource{
+	{URL: "http://download.geonames.org/export/dump/cities1000.zip", Path: "./geobed-data/cities1000.zip", ID: DataSourceGeonamesCities},
+	{URL: "http://download.geonames.org/export/dump/countryInfo.txt", Path: "./geobed-data/countryInfo.txt", ID: DataSourceGeonamesCountry},
+	{URL: "http://download.geonames.org/export/dump/admin1CodesASCII.txt", Path: "./geobed-data/admin1CodesASCII.txt", ID: DataSourceGeonamesAdmin1},
 }
 
 // UsStateCodes maps US state abbreviations to full names.
@@ -303,11 +320,11 @@ func (g *GeoBed) downloadDataSets() error {
 	}
 
 	for _, f := range dataSetFiles {
-		if _, err := os.Stat(f["path"]); err == nil {
+		if _, err := os.Stat(f.Path); err == nil {
 			continue
 		}
-		if err := downloadFile(f["url"], f["path"]); err != nil {
-			return fmt.Errorf("downloading %s: %w", f["id"], err)
+		if err := downloadFile(f.URL, f.Path); err != nil {
+			return fmt.Errorf("downloading %s: %w", f.ID, err)
 		}
 	}
 	return nil
@@ -343,17 +360,17 @@ func (g *GeoBed) loadDataSets() error {
 	tabSplitter := regexp.MustCompile("\t")
 
 	for _, f := range dataSetFiles {
-		switch f["id"] {
-		case "geonamesCities1000":
-			if err := g.loadGeonamesCities(f["path"], tabSplitter); err != nil {
+		switch f.ID {
+		case DataSourceGeonamesCities:
+			if err := g.loadGeonamesCities(f.Path, tabSplitter); err != nil {
 				return fmt.Errorf("loading geonames cities: %w", err)
 			}
-		case "maxmindWorldCities":
-			if err := g.loadMaxMindCities(f["path"]); err != nil {
+		case DataSourceMaxMindCities:
+			if err := g.loadMaxMindCities(f.Path); err != nil {
 				log.Printf("warning: failed to load MaxMind cities: %v", err)
 			}
-		case "geonamesCountryInfo":
-			if err := g.loadGeonamesCountryInfo(f["path"], tabSplitter); err != nil {
+		case DataSourceGeonamesCountry:
+			if err := g.loadGeonamesCountryInfo(f.Path, tabSplitter); err != nil {
 				return fmt.Errorf("loading geonames country info: %w", err)
 			}
 		}
