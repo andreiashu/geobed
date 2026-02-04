@@ -1,8 +1,20 @@
 # Geobed Improvement Plan
 
 **Created:** February 2026
+**Updated:** February 2026
 **Repository:** github.com/jvmatl/geobed (forked)
 **Purpose:** Comprehensive remediation plan for identified issues
+
+---
+
+## Progress Summary
+
+| Phase | Status | Commit |
+|-------|--------|--------|
+| Phase 1: Critical Fixes | ✅ Complete | `cf194e4` |
+| Phase 2: Thread Safety & API | ✅ Complete | `cf194e4` |
+| Phase 3: Performance | 🔲 Pending | - |
+| Phase 4: Polish | 🔲 Pending | - |
 
 ---
 
@@ -20,7 +32,9 @@
 
 ## 1. Critical Issues
 
-### 1.1 Defer Before Error Check (Line 246)
+### 1.1 ✅ Defer Before Error Check (Line 246) — FIXED
+
+**Status:** Fixed in commit `cf194e4`
 
 **Problem:**
 ```go
@@ -37,21 +51,25 @@ If `http.Get` fails, `r` is nil, and `defer r.Body.Close()` causes a nil pointer
 
 The [correct Go pattern](https://medium.com/@KeithAlpichi/go-gotcha-closing-a-nil-http-response-body-with-defer-9b7a3eb30e8c) is to always check errors before deferring cleanup. As noted in [Go defer best practices](https://dev.to/zakariachahboun/common-use-cases-for-defer-in-go-1071), "get the resource, check for any error, and only then defer the close."
 
-**Solution:**
-```go
-r, rErr := http.Get(f["url"])
-if rErr != nil {
-    log.Printf("failed to download %s: %v", f["url"], rErr)
-    continue
-}
-defer r.Body.Close()
-```
+**Solution Applied:**
 
-**Files:** `geobed.go:246`
+Refactored `downloadDataSets()` into a new `downloadFile()` helper with proper error handling:
+```go
+func downloadFile(url, path string) error {
+    resp, err := http.Get(url)
+    if err != nil {
+        return fmt.Errorf("HTTP GET %s: %w", url, err)
+    }
+    defer resp.Body.Close()  // Now safely after error check
+    // ...
+}
+```
 
 ---
 
-### 1.2 log.Fatal() Crashes Application (Lines 274, 281, 427)
+### 1.2 ✅ log.Fatal() Crashes Application — FIXED
+
+**Status:** Fixed in commit `cf194e4`
 
 **Problem:**
 
@@ -65,35 +83,26 @@ defer r.Body.Close()
 
 According to [Go error handling best practices](https://go.dev/blog/error-handling-and-go), `log.Fatal()` should only be used in `main()` for truly unrecoverable startup errors. The [JetBrains Go guide](https://www.jetbrains.com/guide/go/tutorials/handle_errors_in_go/best_practices/) states: "Crashing is not always the best option. If an error is easy to recover from, crashing the whole application is an overreaction."
 
-The modern Go approach is to return errors up the call stack with context using `fmt.Errorf` with `%w` for error wrapping.
+**Solution Applied:**
 
-**Solution:**
-
-Change `NewGeobed()` signature to return error:
+Changed `NewGeobed()` signature to return error:
 ```go
 func NewGeobed() (*GeoBed, error) {
     // ...
     if err != nil {
         return nil, fmt.Errorf("failed to load geobed data: %w", err)
     }
-    return &g, nil
+    return g, nil
 }
 ```
 
-For internal functions, propagate errors instead of calling `log.Fatal()`:
-```go
-// Before
-log.Fatal("Error parsing file: ", err)
-
-// After
-return fmt.Errorf("parsing %s: %w", filename, err)
-```
-
-**Files:** `geobed.go:274, 281, 427`
+All internal functions now propagate errors instead of calling `log.Fatal()`.
 
 ---
 
-### 1.3 Missing Bounds Check (Line 438)
+### 1.3 ✅ Missing Bounds Check (Line 438) — FIXED
+
+**Status:** Fixed in commit `cf194e4`
 
 **Problem:**
 ```go
@@ -106,12 +115,14 @@ Empty lines in data files cause index out of bounds panic.
 
 Defensive programming requires validating slice bounds before access. This is a common source of production panics.
 
-**Solution:**
-```go
-if len(t) > 0 && string(t[0]) != "#" {
-```
+**Solution Applied:**
 
-**Files:** `geobed.go:438`
+Refactored into `loadGeonamesCountryInfo()` with proper bounds check:
+```go
+if len(t) == 0 || t[0] == '#' {
+    continue
+}
+```
 
 ---
 
@@ -235,7 +246,9 @@ city.City = unique.Make(cityName)
 
 ---
 
-### 2.4 Global Mutable State (Thread Safety)
+### 2.4 ✅ Global Mutable State (Thread Safety) — FIXED
+
+**Status:** Fixed in commit `cf194e4`
 
 **Problem:**
 
@@ -258,33 +271,34 @@ These package-level variables are:
 
 For singleton initialization, use [`sync.Once`](https://leapcell.io/blog/go-sync-once-pattern) which "guarantees that the initialization function is called exactly once, even in a concurrent environment."
 
-**Solution:**
+**Solution Applied:**
 
-Move indices into the GeoBed struct:
+Moved `cityNameIdx` into the GeoBed struct:
 ```go
 type GeoBed struct {
-    c            Cities
-    co           []CountryInfo
-    cityNameIdx  map[string]int  // Move from global
-    mu           sync.RWMutex    // For thread-safe access
-}
-
-// For singleton pattern with thread-safe initialization:
-var (
-    defaultGeobed *GeoBed
-    geobedOnce    sync.Once
-    geobedErr     error
-)
-
-func GetDefaultGeobed() (*GeoBed, error) {
-    geobedOnce.Do(func() {
-        defaultGeobed, geobedErr = NewGeobed()
-    })
-    return defaultGeobed, geobedErr
+    c           Cities
+    co          []CountryInfo
+    cityNameIdx map[string]int  // Moved from global
 }
 ```
 
-**Files:** `geobed.go` (struct definition, initialization)
+Added `GetDefaultGeobed()` with `sync.Once` for thread-safe singleton:
+```go
+var (
+    defaultGeobed     *GeoBed
+    defaultGeobedOnce sync.Once
+    defaultGeobedErr  error
+)
+
+func GetDefaultGeobed() (*GeoBed, error) {
+    defaultGeobedOnce.Do(func() {
+        defaultGeobed, defaultGeobedErr = NewGeobed()
+    })
+    return defaultGeobed, defaultGeobedErr
+}
+```
+
+Note: `locationDedupeIdx` and `maxMindCityDedupeIdx` remain as temporary globals used only during data loading and are cleared after use.
 
 ---
 
@@ -334,7 +348,9 @@ func (g *GeoBed) store() error {
 
 ---
 
-### 3.2 Commented-Out Code Throughout
+### 3.2 ✅ Commented-Out Code Throughout — FIXED
+
+**Status:** Fixed in commit `cf194e4`
 
 **Problem:**
 
@@ -348,15 +364,13 @@ Multiple sections of commented-out code:
 
 Dead code increases cognitive load and maintenance burden. If code is not needed, remove it. If it might be needed later, document why in an issue or design doc.
 
-**Solution:**
+**Solution Applied:**
 
-1. Remove commented-out code entirely
-2. Create GitHub issues for features that might be revisited:
-   - Issue: "Consider re-enabling MaxMind dataset for additional city coverage"
-   - Issue: "Evaluate airport code geocoding feature"
-3. Use git history to recover code if needed later
-
-**Files:** `geobed.go`, `geobed_test.go`
+1. Removed commented-out MaxMind dataset entries from `dataSetFiles`
+2. Removed commented-out airport code logic from `fuzzyMatchLocation()`
+3. Removed commented-out TODO comments about string interning and mmap
+4. Cleaned up test file by removing disabled test cases and updating working ones
+5. Removed verbose debug logging statements
 
 ---
 
@@ -449,34 +463,41 @@ func NewGeobed() (*GeoBed, error) {
 
 ---
 
-### 3.5 Logic Error in openOptionallyBzippedFile (Line 1067)
+### 3.5 ✅ Logic Error in openOptionallyBzippedFile (Line 1067) — FIXED
+
+**Status:** Fixed in commit `cf194e4`
 
 **Problem:**
 
-The function has incorrect return logic - returns nil on success path.
+The function had incorrect return logic - `if err == nil` should have been `if err != nil`:
+```go
+fh, err = openOptionallyCachedFile(file)
+if err == nil {  // ⚠️ Wrong condition!
+    return nil, err
+}
+```
 
 **Synthesis:**
 
 Review and fix control flow to ensure proper reader return.
 
-**Solution:**
+**Solution Applied:**
 
-Audit the function and ensure all paths return correctly:
+Fixed the logic error and simplified the function:
 ```go
-func openOptionallyBzippedFile(path string) (io.Reader, error) {
-    f, err := os.Open(path)
+func openOptionallyBzippedFile(file string) (io.Reader, error) {
+    fh, err := openOptionallyCachedFile(file + ".bz2")
     if err != nil {
-        return nil, err  // Error case
+        // Try uncompressed version
+        fh, err = openOptionallyCachedFile(file)
+        if err != nil {
+            return nil, fmt.Errorf("opening %s: %w", file, err)
+        }
+        return fh, nil
     }
-
-    if strings.HasSuffix(path, ".bz2") {
-        return bzip2.NewReader(f), nil  // Success with bzip2
-    }
-    return f, nil  // Success without compression
+    return bzip2.NewReader(fh), nil
 }
 ```
-
-**Files:** `geobed.go:1067`
 
 ---
 
@@ -678,43 +699,43 @@ func (s *GeobedSuite) TestConcurrentGeocode(c *check.C) {
 
 ## 6. Documentation & Operational Issues
 
-### 6.1 Missing API Documentation
+### 6.1 ✅ Missing API Documentation — FIXED
+
+**Status:** Fixed in commit `cf194e4`
 
 **Problem:**
 
 No Go doc comments on public functions.
 
-**Solution:**
+**Solution Applied:**
 
-Add comprehensive documentation:
+Added comprehensive godoc comments to all public types and functions:
+- `GeoBed` struct with usage description
+- `NewGeobed()` with example code
+- `GetDefaultGeobed()` for singleton pattern
+- `Geocode()` with options documentation
+- `ReverseGeocode()` with coordinate examples
+- All helper functions with clear descriptions
+
+Example:
 ```go
-// GeoBed provides offline geocoding capabilities using embedded city data.
-// It supports both forward geocoding (name → coordinates) and reverse
-// geocoding (coordinates → location).
+// NewGeobed creates a new GeoBed instance with geocoding data loaded into memory.
+// It first attempts to load from embedded cache files, falling back to downloading
+// and parsing raw data files if the cache is unavailable.
 //
-// GeoBed instances are safe for concurrent use after initialization.
-// Initialization loads approximately 2.7 million city records into memory,
-// requiring ~100MB RAM.
-type GeoBed struct { ... }
-
-// NewGeobed creates a new GeoBed instance with default configuration.
-// It loads city data from embedded cache files.
-//
-// Returns an error if data cannot be loaded. The returned GeoBed
-// instance is safe for concurrent use.
+// Returns an error if data cannot be loaded from either source.
+// For a shared instance with thread-safe initialization, use GetDefaultGeobed() instead.
 //
 // Example:
 //
-//     g, err := NewGeobed()
-//     if err != nil {
-//         log.Fatal(err)
-//     }
-//     city := g.Geocode("Austin, TX")
-//     fmt.Printf("%s: %f, %f\n", city.City, city.Latitude, city.Longitude)
+//	g, err := NewGeobed()
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	city := g.Geocode("Austin, TX")
+//	fmt.Printf("%s: %f, %f\n", city.City, city.Latitude, city.Longitude)
 func NewGeobed() (*GeoBed, error) { ... }
 ```
-
-**Files:** `geobed.go`
 
 ---
 
@@ -761,51 +782,52 @@ upx --best geobed                 # Compress with UPX
 
 ## 7. Implementation Priority Matrix
 
-| Priority | Issue | Impact | Effort | Category |
-|----------|-------|--------|--------|----------|
-| **P0** | Defer before error check | Critical bug | Low | Critical |
-| **P0** | log.Fatal() usage | Critical bug | Medium | Critical |
-| **P0** | Missing bounds check | Critical bug | Low | Critical |
-| **P1** | Thread-safe initialization | Data race | Medium | Memory/Perf |
-| **P1** | Return errors from NewGeobed | API breaking | Medium | Critical |
-| **P2** | S2 spatial index | Performance | High | Memory/Perf |
-| **P2** | String interning | Memory | Medium | Memory/Perf |
-| **P2** | API documentation | Usability | Medium | Docs |
-| **P3** | Remove commented code | Maintainability | Low | Code Quality |
-| **P3** | Type-safe data sources | Maintainability | Low | Code Quality |
-| **P3** | Configurable paths | Flexibility | Low | Code Quality |
-| **P3** | Comprehensive tests | Reliability | Medium | Testing |
-| **P4** | Fuzzy matching (Levenshtein) | Feature | Medium | Design |
-| **P4** | International admin divisions | Feature | High | Design |
-| **P4** | Build tags for lite version | Deployment | Medium | Operational |
-| **P4** | Data update mechanism | Freshness | Medium | Operational |
+| Priority | Issue | Impact | Effort | Category | Status |
+|----------|-------|--------|--------|----------|--------|
+| **P0** | Defer before error check | Critical bug | Low | Critical | ✅ Done |
+| **P0** | log.Fatal() usage | Critical bug | Medium | Critical | ✅ Done |
+| **P0** | Missing bounds check | Critical bug | Low | Critical | ✅ Done |
+| **P1** | Thread-safe initialization | Data race | Medium | Memory/Perf | ✅ Done |
+| **P1** | Return errors from NewGeobed | API breaking | Medium | Critical | ✅ Done |
+| **P2** | S2 spatial index | Performance | High | Memory/Perf | 🔲 Pending |
+| **P2** | String interning | Memory | Medium | Memory/Perf | 🔲 Pending |
+| **P2** | API documentation | Usability | Medium | Docs | ✅ Done |
+| **P3** | Remove commented code | Maintainability | Low | Code Quality | ✅ Done |
+| **P3** | Type-safe data sources | Maintainability | Low | Code Quality | 🔲 Pending |
+| **P3** | Configurable paths | Flexibility | Low | Code Quality | 🔲 Pending |
+| **P3** | Comprehensive tests | Reliability | Medium | Testing | 🔲 Pending |
+| **P4** | Fuzzy matching (Levenshtein) | Feature | Medium | Design | 🔲 Pending |
+| **P4** | International admin divisions | Feature | High | Design | 🔲 Pending |
+| **P4** | Build tags for lite version | Deployment | Medium | Operational |🔲 Pending |
+| **P4** | Data update mechanism | Freshness | Medium | Operational | 🔲 Pending |
 
 ---
 
 ## Recommended Implementation Order
 
-### Phase 1: Critical Fixes (Week 1)
-1. Fix defer before error check
-2. Fix missing bounds check
-3. Change NewGeobed to return error
-4. Replace log.Fatal with error returns
+### Phase 1: Critical Fixes ✅ COMPLETE
+1. ✅ Fix defer before error check
+2. ✅ Fix missing bounds check
+3. ✅ Change NewGeobed to return error
+4. ✅ Replace log.Fatal with error returns
 
-### Phase 2: Thread Safety & API (Week 2)
-1. Move global state into struct
-2. Add sync.Once for singleton pattern
-3. Add API documentation
-4. Remove commented-out code
+### Phase 2: Thread Safety & API ✅ COMPLETE
+1. ✅ Move global state into struct
+2. ✅ Add sync.Once for singleton pattern
+3. ✅ Add API documentation
+4. ✅ Remove commented-out code
+5. ✅ Fix logic error in openOptionallyBzippedFile
 
 ### Phase 3: Performance (Weeks 3-4)
-1. Implement S2 spatial index
-2. Add string interning with `unique` package
-3. Add comprehensive benchmarks
+1. 🔲 Implement S2 spatial index
+2. 🔲 Add string interning with `unique` package
+3. 🔲 Add comprehensive benchmarks
 
 ### Phase 4: Polish (Week 5+)
-1. Add comprehensive test cases
-2. Add build tags for lite version
-3. Implement configurable paths
-4. Add data update tooling
+1. 🔲 Add comprehensive test cases
+2. 🔲 Add build tags for lite version
+3. 🔲 Implement configurable paths
+4. 🔲 Add data update tooling
 
 ---
 
