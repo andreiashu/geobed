@@ -17,15 +17,36 @@ type AdminDivision struct {
 // Loaded from admin1CodesASCII.txt
 var adminDivisions = map[string]map[string]AdminDivision{}
 var adminDivisionsOnce sync.Once
+var adminDivisionsDataDir = "./geobed-data" // configurable via setAdminDivisionsDataDir
+var adminDivisionsMu sync.RWMutex           // protects adminDivisionsDataDir
 
-// loadAdminDivisions loads admin1 codes from geobed-data/admin1CodesASCII.txt
+// setAdminDivisionsDataDir sets the data directory for loading admin divisions.
+// Thread-safe: can be called concurrently, but the first call to loadAdminDivisions
+// will use whatever value was set at that moment.
+func setAdminDivisionsDataDir(dir string) {
+	adminDivisionsMu.Lock()
+	defer adminDivisionsMu.Unlock()
+	adminDivisionsDataDir = dir
+}
+
+// getAdminDivisionsDataDir returns the current data directory.
+func getAdminDivisionsDataDir() string {
+	adminDivisionsMu.RLock()
+	defer adminDivisionsMu.RUnlock()
+	return adminDivisionsDataDir
+}
+
+// loadAdminDivisions loads admin1 codes from the configured data directory.
 // Format: CC.CODE<tab>Name<tab>AsciiName<tab>GeonameId
 func loadAdminDivisions() {
 	adminDivisionsOnce.Do(func() {
 		adminDivisions = make(map[string]map[string]AdminDivision)
 
+		// Get the data directory under the read lock
+		dataDir := getAdminDivisionsDataDir()
+
 		// Try to load from file
-		fi, err := os.Open("./geobed-data/admin1CodesASCII.txt")
+		fi, err := os.Open(dataDir + "/admin1CodesASCII.txt")
 		if err != nil {
 			return
 		}

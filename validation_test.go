@@ -19,12 +19,12 @@ func TestDataIntegrity(t *testing.T) {
 		t.Fatalf("Failed to load geobed: %v", err)
 	}
 
-	if len(g.c) < minCityCount {
-		t.Errorf("City count %d is below minimum %d", len(g.c), minCityCount)
+	if len(g.Cities) < minCityCount {
+		t.Errorf("City count %d is below minimum %d", len(g.Cities), minCityCount)
 	}
 
-	if len(g.co) < minCountryCount {
-		t.Errorf("Country count %d is below minimum %d", len(g.co), minCountryCount)
+	if len(g.Countries) < minCountryCount {
+		t.Errorf("Country count %d is below minimum %d", len(g.Countries), minCountryCount)
 	}
 
 	// Check that we have cities on all continents (basic global coverage)

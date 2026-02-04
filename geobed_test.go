@@ -1,6 +1,7 @@
 package geobed
 
 import (
+	"sync"
 	"testing"
 
 	. "gopkg.in/check.v1"
@@ -28,11 +29,11 @@ func (s *GeobedSuite) TestANewGeobed(c *C) {
 	g, err = NewGeobed()
 	c.Assert(err, IsNil)
 	c.Assert(g, Not(IsNil))
-	c.Assert(len(g.c), Not(Equals), 0)
-	c.Assert(len(g.co), Not(Equals), 0)
+	c.Assert(len(g.Cities), Not(Equals), 0)
+	c.Assert(len(g.Countries), Not(Equals), 0)
 	c.Assert(len(g.cityNameIdx), Not(Equals), 0)
-	c.Assert(g.c, FitsTypeOf, []GeobedCity(nil))
-	c.Assert(g.co, FitsTypeOf, []CountryInfo(nil))
+	c.Assert(g.Cities, FitsTypeOf, []GeobedCity(nil))
+	c.Assert(g.Countries, FitsTypeOf, []CountryInfo(nil))
 	c.Assert(g.cityNameIdx, FitsTypeOf, make(map[string]int))
 }
 
@@ -124,5 +125,58 @@ func BenchmarkGeocode(b *testing.B) {
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		g.Geocode("New York")
+	}
+}
+
+// TestConcurrentNewGeobed verifies that multiple goroutines can safely
+// call NewGeobed simultaneously without races or panics.
+func TestConcurrentNewGeobed(t *testing.T) {
+	const numGoroutines = 10
+
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines)
+	instances := make(chan *GeoBed, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gb, err := NewGeobed()
+			if err != nil {
+				errors <- err
+				return
+			}
+			instances <- gb
+		}()
+	}
+
+	wg.Wait()
+	close(errors)
+	close(instances)
+
+	// Check for errors
+	for err := range errors {
+		t.Fatalf("NewGeobed failed: %v", err)
+	}
+
+	// Verify all instances work correctly
+	var allInstances []*GeoBed
+	for gb := range instances {
+		allInstances = append(allInstances, gb)
+	}
+
+	if len(allInstances) != numGoroutines {
+		t.Fatalf("Expected %d instances, got %d", numGoroutines, len(allInstances))
+	}
+
+	// Test each instance can geocode correctly
+	for i, gb := range allInstances {
+		result := gb.Geocode("Austin, TX")
+		if result.City != "Austin" {
+			t.Errorf("Instance %d: expected Austin, got %s", i, result.City)
+		}
+		if result.Country() != "US" {
+			t.Errorf("Instance %d: expected US, got %s", i, result.Country())
+		}
 	}
 }

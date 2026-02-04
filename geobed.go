@@ -16,6 +16,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -48,9 +49,9 @@ type DataSource struct {
 
 // dataSetFiles defines the data sources for geocoding data.
 var dataSetFiles = []DataSource{
-	{URL: "http://download.geonames.org/export/dump/cities1000.zip", Path: "./geobed-data/cities1000.zip", ID: DataSourceGeonamesCities},
-	{URL: "http://download.geonames.org/export/dump/countryInfo.txt", Path: "./geobed-data/countryInfo.txt", ID: DataSourceGeonamesCountry},
-	{URL: "http://download.geonames.org/export/dump/admin1CodesASCII.txt", Path: "./geobed-data/admin1CodesASCII.txt", ID: DataSourceGeonamesAdmin1},
+	{URL: "https://download.geonames.org/export/dump/cities1000.zip", Path: "./geobed-data/cities1000.zip", ID: DataSourceGeonamesCities},
+	{URL: "https://download.geonames.org/export/dump/countryInfo.txt", Path: "./geobed-data/countryInfo.txt", ID: DataSourceGeonamesCountry},
+	{URL: "https://download.geonames.org/export/dump/admin1CodesASCII.txt", Path: "./geobed-data/admin1CodesASCII.txt", ID: DataSourceGeonamesAdmin1},
 }
 
 // UsStateCodes maps US state abbreviations to full names.
@@ -77,27 +78,140 @@ var UsStateCodes = map[string]string{
 	"AA": "Armed Forces Americas", "AE": "Armed Forces Europe", "AP": "Armed Forces Pacific",
 }
 
-// s2CellLevel determines the granularity of the spatial index.
-// Level 10 gives ~10km cells.
+// s2CellLevel determines the granularity of the S2 spatial index for reverse geocoding.
+//
+// S2 cells are a hierarchical spatial indexing system (see https://s2geometry.io/).
+// Level 10 provides approximately 10km x 10km cells at the equator, which offers
+// a good balance between:
+//   - Precision: Cells are small enough to group nearby cities effectively
+//   - Performance: Not too many cells to search for nearby cities
+//   - Memory: Reasonable number of cells in the index
+//
+// Lower levels (e.g., 8) would give ~40km cells - faster but less precise.
+// Higher levels (e.g., 12) would give ~2.5km cells - more precise but more memory.
 const s2CellLevel = 10
 
 // Package-level lookup tables for memory-efficient string storage.
-// Initialized once during first GeoBed creation, then read-only.
+//
+// Architecture Note: These tables are global (not per-instance) because GeobedCity
+// methods like Country() and Region() cannot access instance data - they're called
+// on value types that don't have a reference back to the GeoBed instance. This design
+// allows the memory-efficient indexed storage while maintaining a clean API.
+//
+// Thread Safety: Each stringInterner has its own RWMutex protecting all access:
+//   - Writes (interning new values) acquire the write lock
+//   - Reads (lookup by index) acquire the read lock
+//   - Initialization uses sync.Once for one-time setup
+//
+// Memory Efficiency: By storing string indexes (uint8/uint16) instead of strings
+// in each GeobedCity, we save ~24 bytes per city (two string headers). With ~145K
+// cities, this saves ~3.5MB of memory.
+
+// stringInterner provides thread-safe string interning with integer indexes.
+// T must be an unsigned integer type (uint8 or uint16).
+type stringInterner[T ~uint8 | ~uint16] struct {
+	mu     sync.RWMutex
+	lookup []string     // index -> string
+	index  map[string]T // string -> index
+}
+
+// newStringInterner creates a new string interner with the given initial capacity.
+// Index 0 is reserved for the empty string.
+func newStringInterner[T ~uint8 | ~uint16](capacity int) *stringInterner[T] {
+	si := &stringInterner[T]{
+		lookup: make([]string, 1, capacity), // index 0 = ""
+		index:  make(map[string]T, capacity),
+	}
+	si.lookup[0] = ""
+	si.index[""] = 0
+	return si
+}
+
+// intern returns the index for a string, creating it if needed.
+// Thread-safe: uses double-checked locking pattern.
+func (si *stringInterner[T]) intern(s string) T {
+	// Fast path: check with read lock
+	si.mu.RLock()
+	if idx, ok := si.index[s]; ok {
+		si.mu.RUnlock()
+		return idx
+	}
+	si.mu.RUnlock()
+
+	// Slow path: acquire write lock and check again
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	if idx, ok := si.index[s]; ok {
+		return idx
+	}
+	idx := T(len(si.lookup))
+	si.lookup = append(si.lookup, s)
+	si.index[s] = idx
+	return idx
+}
+
+// get returns the string for an index, or empty string if out of bounds.
+func (si *stringInterner[T]) get(idx T) string {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	if int(idx) < len(si.lookup) {
+		return si.lookup[idx]
+	}
+	return ""
+}
+
+// count returns the number of interned strings.
+func (si *stringInterner[T]) count() int {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	return len(si.lookup)
+}
+
 var (
-	countryLookup []string          // index -> country code
-	countryIndex  map[string]uint8  // country code -> index
-	regionLookup  []string          // index -> region code
-	regionIndex   map[string]uint16 // region code -> index
-	lookupOnce    sync.Once
+	countryInterner *stringInterner[uint8]
+	regionInterner  *stringInterner[uint16]
+	lookupOnce      sync.Once
 )
+
+// GeobedConfig contains configuration options for GeoBed initialization.
+type GeobedConfig struct {
+	DataDir  string // Directory for raw data files (default: "./geobed-data")
+	CacheDir string // Directory for cache files (default: "./geobed-cache")
+}
+
+// Option is a functional option for configuring GeoBed.
+type Option func(*GeobedConfig)
+
+// WithDataDir sets the directory for raw data files.
+func WithDataDir(dir string) Option {
+	return func(c *GeobedConfig) {
+		c.DataDir = dir
+	}
+}
+
+// WithCacheDir sets the directory for cache files.
+func WithCacheDir(dir string) Option {
+	return func(c *GeobedConfig) {
+		c.CacheDir = dir
+	}
+}
+
+// defaultConfig returns the default configuration.
+func defaultConfig() *GeobedConfig {
+	return &GeobedConfig{
+		DataDir:  "./geobed-data",
+		CacheDir: "./geobed-cache",
+	}
+}
 
 // GeoBed provides offline geocoding using embedded city data.
 // Safe for concurrent use after initialization.
 type GeoBed struct {
-	c           Cities
-	co          []CountryInfo
-	cityNameIdx map[string]int
-	cellIndex   map[s2.CellID][]int
+	Cities      Cities              // All loaded cities, sorted by name
+	Countries   []CountryInfo       // Country metadata from Geonames
+	cityNameIdx map[string]int      // index for city name search ranges
+	cellIndex   map[s2.CellID][]int // S2 cell index for reverse geocoding
+	config      *GeobedConfig       // Configuration options
 }
 
 // Cities is a sortable slice of GeobedCity.
@@ -121,18 +235,24 @@ type GeobedCity struct {
 
 // Country returns the ISO 3166-1 alpha-2 country code (e.g., "US", "FR").
 func (c GeobedCity) Country() string {
-	if int(c.country) < len(countryLookup) {
-		return countryLookup[c.country]
-	}
-	return ""
+	return countryInterner.get(c.country)
 }
 
 // Region returns the administrative region code (e.g., "TX", "CA").
 func (c GeobedCity) Region() string {
-	if int(c.region) < len(regionLookup) {
-		return regionLookup[c.region]
-	}
-	return ""
+	return regionInterner.get(c.region)
+}
+
+// CountryCount returns the number of unique country codes in the lookup table.
+// Useful for testing and debugging.
+func CountryCount() int {
+	return countryInterner.count()
+}
+
+// RegionCount returns the number of unique region codes in the lookup table.
+// Useful for testing and debugging.
+func RegionCount() int {
+	return regionInterner.count()
 }
 
 // geobedCityGob is used for GOB serialization (stores strings, not indexes).
@@ -204,6 +324,10 @@ type r struct {
 
 // NewGeobed creates a new GeoBed instance with geocoding data loaded into memory.
 //
+// Options can be provided to customize data and cache directories:
+//
+//	g, err := NewGeobed(WithDataDir("/custom/data"), WithCacheDir("/custom/cache"))
+//
 // Example:
 //
 //	g, err := NewGeobed()
@@ -212,21 +336,29 @@ type r struct {
 //	}
 //	city := g.Geocode("Austin, TX")
 //	fmt.Printf("%s: %f, %f\n", city.City, city.Latitude, city.Longitude)
-func NewGeobed() (*GeoBed, error) {
-	g := &GeoBed{}
+func NewGeobed(opts ...Option) (*GeoBed, error) {
+	cfg := defaultConfig()
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	// Configure admin divisions data path before any use
+	setAdminDivisionsDataDir(cfg.DataDir)
+
+	g := &GeoBed{config: cfg}
 
 	// Initialize lookup tables (thread-safe, runs once)
 	lookupOnce.Do(initLookupTables)
 
 	var err error
-	g.c, err = loadGeobedCityData()
+	g.Cities, err = loadGeobedCityData()
 	if err == nil {
-		g.co, err = loadGeobedCountryData()
+		g.Countries, err = loadGeobedCountryData()
 	}
 	if err == nil {
 		g.cityNameIdx, err = loadGeobedCityNameIdx()
 	}
-	if err != nil || len(g.c) == 0 {
+	if err != nil || len(g.Cities) == 0 {
 		if downloadErr := g.downloadDataSets(); downloadErr != nil {
 			return nil, fmt.Errorf("failed to download data sets: %w", downloadErr)
 		}
@@ -242,46 +374,26 @@ func NewGeobed() (*GeoBed, error) {
 	return g, nil
 }
 
-// initLookupTables initializes the country and region lookup tables.
+// initLookupTables initializes the country and region string interners.
 func initLookupTables() {
-	countryIndex = make(map[string]uint8, 256)
-	regionIndex = make(map[string]uint16, 8192)
-	countryLookup = make([]string, 0, 256)
-	regionLookup = make([]string, 0, 8192)
-
-	// Index 0 is reserved for empty string
-	countryLookup = append(countryLookup, "")
-	countryIndex[""] = 0
-	regionLookup = append(regionLookup, "")
-	regionIndex[""] = 0
+	countryInterner = newStringInterner[uint8](256)
+	regionInterner = newStringInterner[uint16](8192)
 }
 
 // internCountry returns the index for a country code, creating it if needed.
 func internCountry(code string) uint8 {
-	if idx, ok := countryIndex[code]; ok {
-		return idx
-	}
-	idx := uint8(len(countryLookup))
-	countryLookup = append(countryLookup, code)
-	countryIndex[code] = idx
-	return idx
+	return countryInterner.intern(code)
 }
 
 // internRegion returns the index for a region code, creating it if needed.
 func internRegion(code string) uint16 {
-	if idx, ok := regionIndex[code]; ok {
-		return idx
-	}
-	idx := uint16(len(regionLookup))
-	regionLookup = append(regionLookup, code)
-	regionIndex[code] = idx
-	return idx
+	return regionInterner.intern(code)
 }
 
 // buildCellIndex creates an S2 cell-based spatial index for fast reverse geocoding.
 func (g *GeoBed) buildCellIndex() {
 	g.cellIndex = make(map[s2.CellID][]int)
-	for i, city := range g.c {
+	for i, city := range g.Cities {
 		ll := s2.LatLngFromDegrees(float64(city.Latitude), float64(city.Longitude))
 		cell := s2.CellIDFromLatLng(ll).Parent(s2CellLevel)
 		g.cellIndex[cell] = append(g.cellIndex[cell], i)
@@ -315,15 +427,16 @@ func (g *GeoBed) cellAndNeighbors(cell s2.CellID) []s2.CellID {
 
 // downloadDataSets downloads the raw data files if they don't exist locally.
 func (g *GeoBed) downloadDataSets() error {
-	if err := os.MkdirAll("./geobed-data", 0777); err != nil {
+	if err := os.MkdirAll(g.config.DataDir, 0777); err != nil {
 		return fmt.Errorf("creating data directory: %w", err)
 	}
 
 	for _, f := range dataSetFiles {
-		if _, err := os.Stat(f.Path); err == nil {
+		localPath := g.config.DataDir + "/" + filepath.Base(f.Path)
+		if _, err := os.Stat(localPath); err == nil {
 			continue
 		}
-		if err := downloadFile(f.URL, f.Path); err != nil {
+		if err := downloadFile(f.URL, localPath); err != nil {
 			return fmt.Errorf("downloading %s: %w", f.ID, err)
 		}
 	}
@@ -360,26 +473,28 @@ func (g *GeoBed) loadDataSets() error {
 	tabSplitter := regexp.MustCompile("\t")
 
 	for _, f := range dataSetFiles {
+		localPath := g.config.DataDir + "/" + filepath.Base(f.Path)
 		switch f.ID {
 		case DataSourceGeonamesCities:
-			if err := g.loadGeonamesCities(f.Path, tabSplitter); err != nil {
+			if err := g.loadGeonamesCities(localPath, tabSplitter); err != nil {
 				return fmt.Errorf("loading geonames cities: %w", err)
 			}
 		case DataSourceMaxMindCities:
-			if err := g.loadMaxMindCities(f.Path); err != nil {
-				log.Printf("warning: failed to load MaxMind cities: %v", err)
+			// MaxMind is optional supplemental data; continue on error
+			if err := g.loadMaxMindCities(localPath); err != nil {
+				log.Printf("info: MaxMind cities not loaded (optional): %v", err)
 			}
 		case DataSourceGeonamesCountry:
-			if err := g.loadGeonamesCountryInfo(f.Path, tabSplitter); err != nil {
+			if err := g.loadGeonamesCountryInfo(localPath, tabSplitter); err != nil {
 				return fmt.Errorf("loading geonames country info: %w", err)
 			}
 		}
 	}
 
-	sort.Sort(g.c)
+	sort.Sort(g.Cities)
 
 	g.cityNameIdx = make(map[string]int)
-	for k, v := range g.c {
+	for k, v := range g.Cities {
 		if len(v.City) == 0 {
 			continue
 		}
@@ -433,7 +548,7 @@ func (g *GeoBed) loadGeonamesCities(path string, tabSplitter *regexp.Regexp) err
 			}
 
 			if len(c.City) > 0 {
-				g.c = append(g.c, c)
+				g.Cities = append(g.Cities, c)
 			}
 		}
 	}
@@ -501,7 +616,7 @@ func (g *GeoBed) loadMaxMindCities(path string) error {
 			}
 
 			if len(c.City) > 0 && c.country != 0 {
-				g.c = append(g.c, c)
+				g.Cities = append(g.Cities, c)
 			}
 		}
 	}
@@ -558,7 +673,7 @@ func (g *GeoBed) loadGeonamesCountryInfo(path string, tabSplitter *regexp.Regexp
 			Neighbours:         fields[17],
 			EquivalentFipsCode: fields[18],
 		}
-		g.co = append(g.co, ci)
+		g.Countries = append(g.Countries, ci)
 	}
 	return nil
 }
@@ -607,7 +722,7 @@ func (g *GeoBed) exactMatchCity(n string) GeobedCity {
 	matchingCities := []GeobedCity{}
 
 	for _, rng := range ranges {
-		for _, v := range g.c[rng.f:rng.t] {
+		for _, v := range g.Cities[rng.f:rng.t] {
 			if strings.EqualFold(n, v.City) {
 				matchingCities = append(matchingCities, v)
 			}
@@ -660,8 +775,8 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 	bestMatchingKey := 0
 
 	for _, rng := range ranges {
-		for i, v := range g.c[rng.f:rng.t] {
-			currentKey := rng.f + i // Correct index into g.c
+		for i, v := range g.Cities[rng.f:rng.t] {
+			currentKey := rng.f + i // Correct index into g.Cities
 			vCountry := v.Country()
 			vRegion := v.Region()
 
@@ -732,15 +847,15 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 		hp := int32(0)
 		hpk := 0
 		for k, v := range bestMatchingKeys {
-			if g.c[k].Population >= 1000 {
+			if g.Cities[k].Population >= 1000 {
 				bestMatchingKeys[k] = v + 1
 			}
-			if g.c[k].Population > hp {
+			if g.Cities[k].Population > hp {
 				hpk = k
-				hp = g.c[k].Population
+				hp = g.Cities[k].Population
 			}
 		}
-		if g.c[hpk].Population > 0 {
+		if g.Cities[hpk].Population > 0 {
 			bestMatchingKeys[hpk]++
 		}
 	}
@@ -751,12 +866,12 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 			m = v
 			bestMatchingKey = k
 		}
-		if v == m && g.c[k].Population > g.c[bestMatchingKey].Population {
+		if v == m && g.Cities[k].Population > g.Cities[bestMatchingKey].Population {
 			bestMatchingKey = k
 		}
 	}
 
-	return g.c[bestMatchingKey]
+	return g.Cities[bestMatchingKey]
 }
 
 func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []string) {
@@ -764,7 +879,7 @@ func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []st
 	abbrevSlice := re.FindStringSubmatch(n)
 
 	nCo := ""
-	for _, co := range g.co {
+	for _, co := range g.Countries {
 		re = regexp.MustCompile("(?i)^" + co.Country + ",?\\s|\\s" + co.Country + ",?\\s" + co.Country + "\\s$")
 		if re.MatchString(n) {
 			nCo = co.ISO
@@ -836,7 +951,7 @@ func (g *GeoBed) getSearchRange(nSlice []string) []r {
 				tk = val
 			}
 			if tk == 0 {
-				tk = len(g.c) - 1
+				tk = len(g.Cities) - 1
 			}
 			ranges = append(ranges, r{fk, tk})
 		}
@@ -863,7 +978,7 @@ func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
 		}
 
 		for _, idx := range indices {
-			city := g.c[idx]
+			city := g.Cities[idx]
 			cityLL := s2.LatLngFromDegrees(float64(city.Latitude), float64(city.Longitude))
 			dist := float64(queryLL.Distance(cityLL))
 
@@ -979,14 +1094,14 @@ func ValidateCache() error {
 	}
 
 	// Check city count
-	cityCount := len(g.c)
+	cityCount := len(g.Cities)
 	if cityCount < minCityCount {
 		return fmt.Errorf("city count too low: got %d, want >= %d", cityCount, minCityCount)
 	}
 	fmt.Printf("      City count: %d (OK)\n", cityCount)
 
 	// Check country count
-	countryCount := len(g.co)
+	countryCount := len(g.Countries)
 	if countryCount < minCountryCount {
 		return fmt.Errorf("country count too low: got %d, want >= %d", countryCount, minCountryCount)
 	}
@@ -1023,13 +1138,14 @@ func ValidateCache() error {
 
 // store saves the Geobed data to disk cache.
 func (g *GeoBed) store() error {
-	if err := os.MkdirAll("./geobed-cache", 0777); err != nil {
+	cacheDir := g.config.CacheDir
+	if err := os.MkdirAll(cacheDir, 0777); err != nil {
 		return fmt.Errorf("creating cache directory: %w", err)
 	}
 
 	// Convert to GOB-friendly format
-	gobCities := make([]geobedCityGob, len(g.c))
-	for i, c := range g.c {
+	gobCities := make([]geobedCityGob, len(g.Cities))
+	for i, c := range g.Cities {
 		gobCities[i] = geobedCityGob{
 			City:       c.City,
 			CityAlt:    c.CityAlt,
@@ -1047,15 +1163,15 @@ func (g *GeoBed) store() error {
 	if err := enc.Encode(gobCities); err != nil {
 		return err
 	}
-	if err := os.WriteFile("./geobed-cache/g.c.dmp", b.Bytes(), 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, "g.c.dmp"), b.Bytes(), 0666); err != nil {
 		return err
 	}
 
 	b.Reset()
-	if err := enc.Encode(g.co); err != nil {
+	if err := enc.Encode(g.Countries); err != nil {
 		return err
 	}
-	if err := os.WriteFile("./geobed-cache/g.co.dmp", b.Bytes(), 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, "g.co.dmp"), b.Bytes(), 0666); err != nil {
 		return err
 	}
 
@@ -1063,7 +1179,7 @@ func (g *GeoBed) store() error {
 	if err := enc.Encode(g.cityNameIdx); err != nil {
 		return err
 	}
-	if err := os.WriteFile("./geobed-cache/cityNameIdx.dmp", b.Bytes(), 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, "cityNameIdx.dmp"), b.Bytes(), 0666); err != nil {
 		return err
 	}
 

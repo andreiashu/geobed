@@ -39,11 +39,11 @@ download-data:
 	@echo "=== Downloading Geonames Data ==="
 	@mkdir -p geobed-data
 	@echo "Downloading cities1000.zip..."
-	@curl -f -o geobed-data/cities1000.zip http://download.geonames.org/export/dump/cities1000.zip
+	@curl -f -o geobed-data/cities1000.zip https://download.geonames.org/export/dump/cities1000.zip
 	@echo "Downloading countryInfo.txt..."
-	@curl -f -o geobed-data/countryInfo.txt http://download.geonames.org/export/dump/countryInfo.txt
+	@curl -f -o geobed-data/countryInfo.txt https://download.geonames.org/export/dump/countryInfo.txt
 	@echo "Downloading admin1CodesASCII.txt..."
-	@curl -f -o geobed-data/admin1CodesASCII.txt http://download.geonames.org/export/dump/admin1CodesASCII.txt
+	@curl -f -o geobed-data/admin1CodesASCII.txt https://download.geonames.org/export/dump/admin1CodesASCII.txt
 	@echo ""
 	@echo "Validating downloads..."
 	@test $$(stat -f%z geobed-data/cities1000.zip 2>/dev/null || stat -c%s geobed-data/cities1000.zip) -gt 5000000 \
