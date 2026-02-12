@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -77,6 +78,17 @@ var UsStateCodes = map[string]string{
 	// Armed Forces
 	"AA": "Armed Forces Americas", "AE": "Armed Forces Europe", "AP": "Armed Forces Pacific",
 }
+
+// sortedUsStateCodes returns US state codes sorted alphabetically.
+// Computed once for deterministic iteration order in extractLocationPieces.
+var sortedUsStateCodes = sync.OnceValue(func() []string {
+	codes := make([]string, 0, len(UsStateCodes))
+	for sc := range UsStateCodes {
+		codes = append(codes, sc)
+	}
+	sort.Strings(codes)
+	return codes
+})
 
 // s2CellLevel determines the granularity of the S2 spatial index for reverse geocoding.
 //
@@ -148,9 +160,11 @@ func (si *stringInterner[T]) intern(s string) T {
 	}
 
 	// Overflow protection: check if we've exceeded the type's capacity
-	// This prevents silent data corruption from index wraparound
+	// This prevents silent data corruption from index wraparound.
+	// For uint16, maxVal=65535. Index 0 is reserved for "", so usable
+	// indices are 1..65535, allowing 65535 unique non-empty strings.
 	maxVal := int(^T(0)) // Maximum value for type T (e.g., 65535 for uint16)
-	if len(si.lookup) >= maxVal {
+	if len(si.lookup) > maxVal {
 		panic(fmt.Sprintf("stringInterner capacity exceeded: %d entries (max %d)", len(si.lookup), maxVal))
 	}
 
@@ -307,11 +321,9 @@ type geobedCityGob struct {
 	Population int32
 }
 
-// Temporary indices used during data loading.
-var (
-	maxMindCityDedupeIdx map[string][]string
-	locationDedupeIdx    map[string]bool
-)
+// maxFuzzyDistance caps FuzzyDistance to prevent expensive O(N) scans
+// across the entire name index with high edit distances.
+const maxFuzzyDistance = 3
 
 // downloadMu protects data file downloads and cache generation from race conditions.
 // Without this, concurrent NewGeobed() calls when cache is missing could corrupt files.
@@ -400,6 +412,12 @@ func NewGeobed(opts ...Option) (*GeoBed, error) {
 		g.nameIndex, err = loadNameIndex()
 	}
 	if err != nil || len(g.Cities) == 0 {
+		// Reset any partially loaded data before full reload to prevent
+		// duplication (e.g., cities loaded from cache but nameIndex failed).
+		g.Cities = nil
+		g.Countries = nil
+		g.nameIndex = nil
+
 		if downloadErr := g.downloadDataSets(); downloadErr != nil {
 			return nil, fmt.Errorf("failed to download data sets: %w", downloadErr)
 		}
@@ -515,18 +533,35 @@ func downloadFile(url, path string) error {
 	if err != nil {
 		return fmt.Errorf("creating file %s: %w", path, err)
 	}
-	defer out.Close()
+
+	// Use a flag to track success so the deferred cleanup can remove
+	// partial files on error. This also ensures Close() errors on the
+	// success path are not silently lost.
+	success := false
+	defer func() {
+		out.Close()
+		if !success {
+			os.Remove(path) // best-effort cleanup of partial file
+		}
+	}()
 
 	if _, err := io.Copy(out, resp.Body); err != nil {
-		os.Remove(path)
 		return fmt.Errorf("writing file %s: %w", path, err)
 	}
+
+	// Explicitly close to catch flush errors (e.g., on NFS)
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("closing file %s: %w", path, err)
+	}
+	success = true
 	return nil
 }
 
 // loadDataSets parses the raw data files and populates the GeoBed instance.
 func (g *GeoBed) loadDataSets() error {
-	locationDedupeIdx = make(map[string]bool)
+	// Dedup indices are local (not package-level) to avoid data races
+	// when multiple goroutines call NewGeobed() concurrently.
+	locationDedupeIdx := make(map[string]bool)
 
 	for _, f := range dataSetFiles {
 		localPath := g.config.DataDir + "/" + filepath.Base(f.Path)
@@ -537,7 +572,7 @@ func (g *GeoBed) loadDataSets() error {
 			}
 		case DataSourceMaxMindCities:
 			// MaxMind is optional supplemental data; continue on error
-			if err := g.loadMaxMindCities(localPath); err != nil {
+			if err := g.loadMaxMindCities(localPath, locationDedupeIdx); err != nil {
 				log.Printf("info: MaxMind cities not loaded (optional): %v", err)
 			}
 		case DataSourceGeonamesCountry:
@@ -636,8 +671,9 @@ func (g *GeoBed) processZipEntry(uF *zip.File) error {
 	return nil
 }
 
-func (g *GeoBed) loadMaxMindCities(path string) error {
-	maxMindCityDedupeIdx = make(map[string][]string)
+func (g *GeoBed) loadMaxMindCities(path string, locationDedupeIdx map[string]bool) error {
+	// maxMindCityDedupeIdx is local to avoid data races in concurrent loads.
+	maxMindCityDedupeIdx := make(map[string][]string)
 
 	fi, err := os.Open(path)
 	if err != nil {
@@ -706,8 +742,6 @@ func (g *GeoBed) loadMaxMindCities(path string) error {
 		}
 	}
 
-	maxMindCityDedupeIdx = nil
-	locationDedupeIdx = nil
 	return nil
 }
 
@@ -796,6 +830,11 @@ func (g *GeoBed) Geocode(n string, opts ...GeocodeOptions) GeobedCity {
 		options = opts[0]
 	}
 
+	// Cap FuzzyDistance to prevent excessive O(N) scans of the name index.
+	if options.FuzzyDistance > maxFuzzyDistance {
+		options.FuzzyDistance = maxFuzzyDistance
+	}
+
 	if options.ExactCity {
 		c = g.exactMatchCity(n)
 	} else {
@@ -866,13 +905,17 @@ func (g *GeoBed) exactMatchCity(n string) GeobedCity {
 				}
 			}
 
-			biggestCity := GeobedCity{}
-			for _, city := range matchingCountryCities {
-				if city.Population > biggestCity.Population {
-					biggestCity = city
+			if len(matchingCountryCities) > 0 {
+				// Default to first match so we return a valid city even
+				// when all candidates have Population=0.
+				biggestCity := matchingCountryCities[0]
+				for _, city := range matchingCountryCities[1:] {
+					if city.Population > biggestCity.Population {
+						biggestCity = city
+					}
 				}
+				c = biggestCity
 			}
-			c = biggestCity
 		}
 	}
 	return c
@@ -1021,9 +1064,13 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 		if v > m {
 			m = v
 			bestMatchingKey = k
-		}
-		if v == m && bestMatchingKey >= 0 && g.Cities[k].Population > g.Cities[bestMatchingKey].Population {
-			bestMatchingKey = k
+		} else if v == m && bestMatchingKey >= 0 {
+			if g.Cities[k].Population > g.Cities[bestMatchingKey].Population {
+				bestMatchingKey = k
+			} else if g.Cities[k].Population == g.Cities[bestMatchingKey].Population && k < bestMatchingKey {
+				// Deterministic tiebreaker: prefer lower index when score and population tie
+				bestMatchingKey = k
+			}
 		}
 	}
 
@@ -1035,13 +1082,14 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 	return g.Cities[bestMatchingKey]
 }
 
-// abbrevRegex is compiled once for extracting 2-3 character abbreviations.
+// abbrevRegex is compiled once for extracting standalone 2-3 letter tokens
+// that could be region/country abbreviations (e.g., "TX", "NY", "US").
 var abbrevRegex = sync.OnceValue(func() *regexp.Regexp {
-	return regexp.MustCompile(`[\S]{2,3}`)
+	return regexp.MustCompile(`\b[A-Za-z]{2,3}\b`)
 })
 
 func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []string) {
-	abbrevSlice := abbrevRegex().FindStringSubmatch(n)
+	abbrevSlice := abbrevRegex().FindAllString(n, -1)
 
 	nCo := ""
 	// Check for country names using string operations (safe, fast)
@@ -1087,8 +1135,9 @@ func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []st
 	}
 
 	nSt := ""
-	// Check US state codes using string operations (safe, fast)
-	for sc := range UsStateCodes {
+	// Check US state codes using string operations (safe, fast).
+	// Iterate over sorted keys for deterministic matching order.
+	for _, sc := range sortedUsStateCodes() {
 		scLower := toLower(sc)
 		nLower := toLower(n)
 
@@ -1190,6 +1239,13 @@ type reverseCandidate struct {
 
 // ReverseGeocode converts lat/lng coordinates to a city location.
 func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
+	// Reject invalid float values that could cause undefined behavior
+	// in S2 geometry calculations.
+	if math.IsNaN(lat) || math.IsNaN(lng) ||
+		math.IsInf(lat, 0) || math.IsInf(lng, 0) {
+		return GeobedCity{}
+	}
+
 	queryLL := s2.LatLngFromDegrees(lat, lng)
 	queryCell := s2.CellIDFromLatLng(queryLL).Parent(s2CellLevel)
 
@@ -1213,12 +1269,15 @@ func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
 		return GeobedCity{}
 	}
 
-	// Sort by distance, then by population (descending) as tiebreaker
-	sort.Slice(candidates, func(i, j int) bool {
+	// Sort by distance, then population (desc), then city name for full determinism.
+	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].dist != candidates[j].dist {
 			return candidates[i].dist < candidates[j].dist
 		}
-		return candidates[i].city.Population > candidates[j].city.Population
+		if candidates[i].city.Population != candidates[j].city.Population {
+			return candidates[i].city.Population > candidates[j].city.Population
+		}
+		return candidates[i].city.City < candidates[j].city.City
 	})
 
 	best := candidates[0]
