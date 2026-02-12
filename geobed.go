@@ -330,18 +330,26 @@ const maxFuzzyDistance = 3
 var downloadMu sync.Mutex
 
 // Singleton pattern for default GeoBed instance.
+// Uses Mutex instead of sync.Once so transient errors allow retry.
 var (
-	defaultGeobed     *GeoBed
-	defaultGeobedOnce sync.Once
-	defaultGeobedErr  error
+	defaultGeobed   *GeoBed
+	defaultGeobedMu sync.Mutex
 )
 
 // GetDefaultGeobed returns a shared GeoBed instance, initializing it on first call.
+// Unlike sync.Once, transient errors (e.g., network down during download) allow retry.
 func GetDefaultGeobed() (*GeoBed, error) {
-	defaultGeobedOnce.Do(func() {
-		defaultGeobed, defaultGeobedErr = NewGeobed()
-	})
-	return defaultGeobed, defaultGeobedErr
+	defaultGeobedMu.Lock()
+	defer defaultGeobedMu.Unlock()
+	if defaultGeobed != nil {
+		return defaultGeobed, nil
+	}
+	g, err := NewGeobed()
+	if err != nil {
+		return nil, err
+	}
+	defaultGeobed = g
+	return g, nil
 }
 
 // CountryInfo contains metadata about a country from Geonames.
@@ -460,9 +468,10 @@ func (g *GeoBed) buildCellIndex() {
 	}
 }
 
-// cellAndNeighbors returns the given cell plus its neighboring cells.
+// cellAndNeighbors returns the given cell plus its neighboring cells in a
+// cross-shaped search area: center (1) + 4 edge + up to 8 diagonal = 13 max.
 func (g *GeoBed) cellAndNeighbors(cell s2.CellID) []s2.CellID {
-	cells := make([]s2.CellID, 0, 9)
+	cells := make([]s2.CellID, 0, 13)
 	cells = append(cells, cell)
 
 	edgeNeighbors := cell.EdgeNeighbors()
@@ -668,7 +677,7 @@ func (g *GeoBed) processZipEntry(uF *zip.File) error {
 			g.Cities = append(g.Cities, c)
 		}
 	}
-	return nil
+	return scanner.Err()
 }
 
 func (g *GeoBed) loadMaxMindCities(path string, locationDedupeIdx map[string]bool) error {
@@ -700,6 +709,10 @@ func (g *GeoBed) loadMaxMindCities(path string, locationDedupeIdx map[string]boo
 			b.WriteString(fields[1])
 			maxMindCityDedupeIdx[b.String()] = fields
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scanning maxmind data: %w", err)
 	}
 
 	for _, fields := range maxMindCityDedupeIdx {
@@ -771,6 +784,13 @@ func (g *GeoBed) loadGeonamesCountryInfo(path string) error {
 		pop, _ := strconv.Atoi(fields[7])
 		gid, _ := strconv.Atoi(fields[16])
 
+		if area > math.MaxInt32 {
+			area = math.MaxInt32
+		}
+		if pop > math.MaxInt32 {
+			pop = math.MaxInt32
+		}
+
 		ci := CountryInfo{
 			ISO:                fields[0],
 			ISO3:               fields[1],
@@ -793,6 +813,9 @@ func (g *GeoBed) loadGeonamesCountryInfo(path string) error {
 			EquivalentFipsCode: fields[18],
 		}
 		g.Countries = append(g.Countries, ci)
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scanning country info: %w", err)
 	}
 	return nil
 }
@@ -848,7 +871,9 @@ func (g *GeoBed) exactMatchCity(n string) GeobedCity {
 	nCo, nSt, _, nSlice := g.extractLocationPieces(n)
 	nWithoutAbbrev := strings.Join(nSlice, " ")
 
-	// Collect candidates from inverted index
+	// Collect candidates from inverted index.
+	// First lookup uses full original query `n` as a fallback for queries
+	// without location context (e.g., just "Austin").
 	candidateSet := make(map[int]bool)
 	if indices, ok := g.nameIndex[toLower(n)]; ok {
 		for _, idx := range indices {
@@ -979,23 +1004,33 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 
 		// Fast path for simple "City, ST" format
 		if nSt != "" {
-			if strings.EqualFold(n, v.City) && strings.EqualFold(nSt, vRegion) {
+			if strings.EqualFold(cleanedQuery, v.City) && strings.EqualFold(nSt, vRegion) {
 				return v
 			}
 		}
 
 		for _, av := range abbrevSlice {
-			lowerAv := toLower(av)
-			if len(av) == 2 && strings.EqualFold(vRegion, lowerAv) {
+			if len(av) == 2 && strings.EqualFold(vRegion, av) {
 				bestMatchingKeys[currentKey] += 5
 			}
-			if len(av) == 2 && strings.EqualFold(vCountry, lowerAv) {
+			if len(av) == 2 && strings.EqualFold(vCountry, av) {
 				bestMatchingKeys[currentKey] += 3
+			}
+			if len(av) == 3 && strings.EqualFold(vRegion, av) {
+				bestMatchingKeys[currentKey] += 4
 			}
 		}
 
-		if nCo != "" && nCo == vCountry {
-			bestMatchingKeys[currentKey] += 4
+		if nCo != "" {
+			if nCo == vCountry {
+				bestMatchingKeys[currentKey] += 4
+			} else {
+				// Country mismatch penalty: when the user explicitly specified a
+				// country (e.g., "Bogota, Colombia"), wrong-country candidates should
+				// score lower to prevent same-name cities from winning via exact-match
+				// bonuses alone.
+				bestMatchingKeys[currentKey] -= 5
+			}
 		}
 
 		if nSt != "" && nSt == vRegion {
@@ -1009,17 +1044,17 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 				if altV == "" {
 					continue
 				}
-				if strings.EqualFold(altV, n) {
+				if strings.EqualFold(altV, cleanedQuery) {
 					bestMatchingKeys[currentKey] += 3
 				}
-				if altV == n {
+				if altV == cleanedQuery {
 					bestMatchingKeys[currentKey] += 5
 				}
 			}
 		}
 
 		// Exact match gets highest bonus
-		if strings.EqualFold(n, v.City) {
+		if strings.EqualFold(cleanedQuery, v.City) {
 			bestMatchingKeys[currentKey] += 7
 		} else if opts.FuzzyDistance > 0 {
 			// Fuzzy matching with Levenshtein distance
@@ -1099,9 +1134,11 @@ func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []st
 		nLower := toLower(n)
 
 		// Check exact match: "France"
+		// Keep n unchanged so it can match city names (e.g., "Singapore" is both
+		// a country and a city). The country scoring (+4 for nCo match) will
+		// still prefer cities in the matched country.
 		if strings.EqualFold(n, countryName) {
 			nCo = co.ISO
-			n = ""
 			break
 		}
 
@@ -1189,6 +1226,34 @@ func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []st
 				nCo = "US"
 			}
 			break
+		}
+	}
+
+	// If no 2-letter code matched, check full US state names (e.g., "Austin, Texas")
+	if nSt == "" {
+		for _, sc := range sortedUsStateCodes() {
+			stateName := UsStateCodes[sc]
+			stateNameLower := toLower(stateName)
+			nLower := toLower(n)
+
+			suffixWithComma := ", " + stateNameLower
+			if len(nLower) > len(suffixWithComma) && nLower[len(nLower)-len(suffixWithComma):] == suffixWithComma {
+				nSt = sc
+				n = n[:len(n)-len(suffixWithComma)]
+				if nCo == "" {
+					nCo = "US"
+				}
+				break
+			}
+			suffixWithSpace := " " + stateNameLower
+			if len(nLower) > len(suffixWithSpace) && nLower[len(nLower)-len(suffixWithSpace):] == suffixWithSpace {
+				nSt = sc
+				n = n[:len(n)-len(suffixWithSpace)]
+				if nCo == "" {
+					nCo = "US"
+				}
+				break
+			}
 		}
 	}
 
@@ -1288,16 +1353,22 @@ func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
 	}
 
 	// Neighborhood override: if closest is a small city (<500K pop),
-	// prefer a nearby city within ~10km that has 10x+ the population.
+	// prefer the most populous nearby city within ~10km that has 10x+ the population.
 	if best.city.Population < 500_000 {
-		for _, c := range candidates[1:] {
+		var override *reverseCandidate
+		for i := range candidates[1:] {
+			c := &candidates[i+1]
 			if c.dist > nearbyThreshold {
 				break
 			}
 			if c.city.Population > best.city.Population*10 {
-				best = c
-				break
+				if override == nil || c.city.Population > override.city.Population {
+					override = c
+				}
 			}
+		}
+		if override != nil {
+			best = *override
 		}
 	}
 
@@ -1484,6 +1555,7 @@ func (g *GeoBed) store() error {
 	}
 
 	b.Reset()
+	enc = gob.NewEncoder(b) // fresh encoder to avoid leaking type-ID state
 	if err := enc.Encode(g.Countries); err != nil {
 		return err
 	}
@@ -1492,6 +1564,7 @@ func (g *GeoBed) store() error {
 	}
 
 	b.Reset()
+	enc = gob.NewEncoder(b) // fresh encoder to avoid leaking type-ID state
 	if err := enc.Encode(g.nameIndex); err != nil {
 		return err
 	}

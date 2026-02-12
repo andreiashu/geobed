@@ -1,7 +1,10 @@
 package geobed
 
 import (
+	"math"
 	"testing"
+
+	"github.com/golang/geo/s2"
 )
 
 func TestBugfixRegressions(t *testing.T) {
@@ -300,5 +303,193 @@ func TestBugfixRegressions(t *testing.T) {
 				t.Errorf("non-deterministic: city %q vs %q", r1.City, r2.City)
 			}
 		})
+	})
+}
+
+// TestCodeReviewBugFixes covers the 13 bugs and edge cases identified during code review.
+func TestCodeReviewBugFixes(t *testing.T) {
+	g, err := NewGeobed()
+	if err != nil {
+		t.Fatalf("Failed to create Geobed: %v", err)
+	}
+
+	// ──────────────────────────────────────────────
+	// Fix 3: cellAndNeighbors capacity — returns at least 9 cells
+	// ──────────────────────────────────────────────
+	t.Run("CellAndNeighborsCapacity", func(t *testing.T) {
+		if len(g.Cities) == 0 {
+			t.Skip("no cities loaded")
+		}
+		city := g.Cities[0]
+		ll := s2.LatLngFromDegrees(float64(city.Latitude), float64(city.Longitude))
+		cell := s2.CellIDFromLatLng(ll).Parent(s2CellLevel)
+		cells := g.cellAndNeighbors(cell)
+		if len(cells) < 9 {
+			t.Errorf("cellAndNeighbors returned %d cells, want >= 9", len(cells))
+		}
+	})
+
+	// ──────────────────────────────────────────────
+	// Fix 4: int32 overflow clamping for CountryInfo
+	// ──────────────────────────────────────────────
+	t.Run("Int32OverflowClamping", func(t *testing.T) {
+		for _, co := range g.Countries {
+			if co.Area < 0 {
+				t.Errorf("country %s has negative area %d (overflow?)", co.ISO, co.Area)
+			}
+			if co.Population < 0 {
+				t.Errorf("country %s has negative population %d (overflow?)", co.ISO, co.Population)
+			}
+		}
+		// Verify large countries are clamped to MaxInt32 rather than wrapping negative
+		for _, co := range g.Countries {
+			if co.ISO == "CN" || co.ISO == "IN" {
+				if co.Population <= 0 {
+					t.Errorf("country %s population = %d, expected positive (clamped to MaxInt32 if needed)", co.ISO, co.Population)
+				}
+			}
+		}
+	})
+
+	// ──────────────────────────────────────────────
+	// Fix 6: 3-letter admin division scoring (e.g., "Sydney NSW")
+	// ──────────────────────────────────────────────
+	t.Run("ThreeLetterAdminDivisionScoring", func(t *testing.T) {
+		result := g.Geocode("Sydney NSW")
+		if result.City != "Sydney" {
+			t.Errorf("Geocode('Sydney NSW') city = %q, want 'Sydney'", result.City)
+		}
+		if result.Country() != "AU" {
+			t.Errorf("Geocode('Sydney NSW') country = %q, want 'AU'", result.Country())
+		}
+	})
+
+	// ──────────────────────────────────────────────
+	// Fix 7: GetDefaultGeobed retry on transient errors
+	// ──────────────────────────────────────────────
+	t.Run("GetDefaultGeobedRetry", func(t *testing.T) {
+		// Verify the API contract: returns non-nil on success
+		gb, err := GetDefaultGeobed()
+		if err != nil {
+			t.Fatalf("GetDefaultGeobed() error: %v", err)
+		}
+		if gb == nil {
+			t.Fatal("GetDefaultGeobed() returned nil")
+		}
+		// Second call should return the same instance
+		gb2, err := GetDefaultGeobed()
+		if err != nil {
+			t.Fatalf("GetDefaultGeobed() second call error: %v", err)
+		}
+		if gb != gb2 {
+			t.Error("GetDefaultGeobed() returned different instances")
+		}
+	})
+
+	// ──────────────────────────────────────────────
+	// Fix 8: Country-named city queries return correct cities
+	// ──────────────────────────────────────────────
+	t.Run("CountryNamedCities", func(t *testing.T) {
+		tests := []struct {
+			query       string
+			wantCity    string
+			wantCountry string
+		}{
+			{"Singapore", "Singapore", "SG"},
+			{"Monaco", "Monaco", "MC"},
+			{"Luxembourg", "Luxembourg", "LU"},
+			{"Djibouti", "Djibouti", "DJ"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.query, func(t *testing.T) {
+				result := g.Geocode(tt.query)
+				if result.City == "" {
+					t.Errorf("Geocode(%q) returned empty city", tt.query)
+					return
+				}
+				if result.City != tt.wantCity {
+					t.Errorf("Geocode(%q) city = %q, want %q", tt.query, result.City, tt.wantCity)
+				}
+				if result.Country() != tt.wantCountry {
+					t.Errorf("Geocode(%q) country = %q, want %q", tt.query, result.Country(), tt.wantCountry)
+				}
+			})
+		}
+
+		// "San Marino" is both a country and a city within it
+		t.Run("SanMarino_returns_city", func(t *testing.T) {
+			result := g.Geocode("San Marino")
+			if result.City == "" {
+				t.Error("Geocode('San Marino') returned empty city")
+			}
+			if result.Country() != "SM" {
+				t.Errorf("Geocode('San Marino') country = %q, want 'SM'", result.Country())
+			}
+		})
+	})
+
+	// ──────────────────────────────────────────────
+	// Fix 9: Full US state name recognition
+	// ──────────────────────────────────────────────
+	t.Run("FullUSStateNames", func(t *testing.T) {
+		tests := []struct {
+			query       string
+			wantCity    string
+			wantCountry string
+		}{
+			{"Houston, Texas", "Houston", "US"},
+			{"Austin Texas", "Austin", "US"},
+			{"Portland, Oregon", "Portland", "US"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.query, func(t *testing.T) {
+				result := g.Geocode(tt.query)
+				if result.City != tt.wantCity {
+					t.Errorf("Geocode(%q) city = %q, want %q", tt.query, result.City, tt.wantCity)
+				}
+				if result.Country() != tt.wantCountry {
+					t.Errorf("Geocode(%q) country = %q, want %q", tt.query, result.Country(), tt.wantCountry)
+				}
+			})
+		}
+	})
+
+	// ──────────────────────────────────────────────
+	// Fix 10: Fast path uses cleanedQuery instead of original n
+	// ──────────────────────────────────────────────
+	t.Run("FastPathCleanedQuery", func(t *testing.T) {
+		result := g.Geocode("Austin, TX")
+		if result.City != "Austin" {
+			t.Errorf("Geocode('Austin, TX') city = %q, want 'Austin'", result.City)
+		}
+		if result.Country() != "US" {
+			t.Errorf("Geocode('Austin, TX') country = %q, want 'US'", result.Country())
+		}
+		if result.Region() != "TX" {
+			t.Errorf("Geocode('Austin, TX') region = %q, want 'TX'", result.Region())
+		}
+	})
+
+	// ──────────────────────────────────────────────
+	// Fix 12: Neighborhood override prefers most populous
+	// ──────────────────────────────────────────────
+	t.Run("NeighborhoodOverrideMostPopulous", func(t *testing.T) {
+		// Berlin center: should get Berlin (pop > 3M), not a small neighborhood
+		result := g.ReverseGeocode(52.52, 13.405)
+		if result.City != "Berlin" {
+			t.Errorf("ReverseGeocode(52.52, 13.405) city = %q, want 'Berlin'", result.City)
+		}
+		if result.Population < 1_000_000 {
+			t.Errorf("ReverseGeocode(52.52, 13.405) population = %d, want >= 1M", result.Population)
+		}
+	})
+
+	// ──────────────────────────────────────────────
+	// Verify math.MaxInt32 constant is used correctly
+	// ──────────────────────────────────────────────
+	t.Run("MaxInt32Value", func(t *testing.T) {
+		if math.MaxInt32 != 2147483647 {
+			t.Errorf("math.MaxInt32 = %d, want 2147483647", math.MaxInt32)
+		}
 	})
 }

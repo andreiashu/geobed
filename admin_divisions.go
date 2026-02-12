@@ -88,6 +88,9 @@ func loadAdminDivisionsForDir(dataDir string) map[string]map[string]AdminDivisio
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		return divisions // don't cache partial data
+	}
 	adminDivisionsCache[dataDir] = divisions
 	return divisions
 }
