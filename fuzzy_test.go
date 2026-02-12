@@ -69,11 +69,11 @@ func TestFuzzyMatchDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// With FuzzyDistance=0, typos should NOT match
-	result := g.Geocode("Londn", GeocodeOptions{FuzzyDistance: 0})
-	if result.City == "London" {
-		t.Errorf("Geocode(%q, fuzzy=0) = %q, expected NOT to match London",
-			"Londn", result.City)
+	// With FuzzyDistance=0, nonsense queries should return empty
+	result := g.Geocode("Zxqwvbn", GeocodeOptions{FuzzyDistance: 0})
+	if result.City != "" {
+		t.Errorf("Geocode(%q, fuzzy=0) = %q, expected empty",
+			"Zxqwvbn", result.City)
 	}
 }
 

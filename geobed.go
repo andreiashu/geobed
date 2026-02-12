@@ -13,7 +13,6 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -224,7 +223,7 @@ func defaultConfig() *GeobedConfig {
 type GeoBed struct {
 	Cities      Cities              // All loaded cities, sorted by name
 	Countries   []CountryInfo       // Country metadata from Geonames
-	cityNameIdx map[string]int      // index for city name search ranges
+	nameIndex   map[string][]int    // inverted index: lowercase name → city indices
 	cellIndex   map[s2.CellID][]int // S2 cell index for reverse geocoding
 	config      *GeobedConfig       // Configuration options
 }
@@ -367,12 +366,6 @@ type GeocodeOptions struct {
 // real-world city names while preventing DoS via excessively long inputs.
 const maxGeocodeInputLen = 256
 
-// r represents an index range for city searches.
-type r struct {
-	f int
-	t int
-}
-
 // NewGeobed creates a new GeoBed instance with geocoding data loaded into memory.
 //
 // Options can be provided to customize data and cache directories:
@@ -404,7 +397,7 @@ func NewGeobed(opts ...Option) (*GeoBed, error) {
 		g.Countries, err = loadGeobedCountryData()
 	}
 	if err == nil {
-		g.cityNameIdx, err = loadGeobedCityNameIdx()
+		g.nameIndex, err = loadNameIndex()
 	}
 	if err != nil || len(g.Cities) == 0 {
 		if downloadErr := g.downloadDataSets(); downloadErr != nil {
@@ -556,26 +549,23 @@ func (g *GeoBed) loadDataSets() error {
 
 	sort.Sort(g.Cities)
 
-	g.cityNameIdx = make(map[string]int)
-	for k, v := range g.Cities {
-		if len(v.City) == 0 {
-			continue
+	g.nameIndex = make(map[string][]int)
+	for i, city := range g.Cities {
+		// Index primary name
+		key := toLower(city.City)
+		if key != "" {
+			g.nameIndex[key] = append(g.nameIndex[key], i)
 		}
-		// Use rune (Unicode character) for indexing to handle multi-byte UTF-8
-		// characters correctly. This matches the search logic in getSearchRange.
-		// Without this, cities like "Åland" or "Örebro" would be indexed by their
-		// first UTF-8 byte (0xC3) instead of their actual first character.
-		runes := []rune(v.City)
-		if len(runes) == 0 {
-			continue
-		}
-		ik := toLower(string(runes[0]))
-		if val, ok := g.cityNameIdx[ik]; ok {
-			if val < k {
-				g.cityNameIdx[ik] = k
+		// Index each comma-separated alt name
+		if city.CityAlt != "" {
+			for _, raw := range strings.Split(city.CityAlt, ",") {
+				alt := strings.TrimSpace(raw)
+				if alt == "" {
+					continue
+				}
+				altKey := toLower(alt)
+				g.nameIndex[altKey] = append(g.nameIndex[altKey], i)
 			}
-		} else {
-			g.cityNameIdx[ik] = k
 		}
 	}
 	return nil
@@ -818,18 +808,27 @@ func (g *GeoBed) exactMatchCity(n string) GeobedCity {
 	var c GeobedCity
 	nCo, nSt, _, nSlice := g.extractLocationPieces(n)
 	nWithoutAbbrev := strings.Join(nSlice, " ")
-	ranges := g.getSearchRange(nSlice)
+
+	// Collect candidates from inverted index
+	candidateSet := make(map[int]bool)
+	if indices, ok := g.nameIndex[toLower(n)]; ok {
+		for _, idx := range indices {
+			candidateSet[idx] = true
+		}
+	}
+	if nWithoutAbbrev != n {
+		if indices, ok := g.nameIndex[toLower(nWithoutAbbrev)]; ok {
+			for _, idx := range indices {
+				candidateSet[idx] = true
+			}
+		}
+	}
 
 	matchingCities := []GeobedCity{}
-
-	for _, rng := range ranges {
-		for _, v := range g.Cities[rng.f:rng.t] {
-			if strings.EqualFold(n, v.City) {
-				matchingCities = append(matchingCities, v)
-			}
-			if strings.EqualFold(nWithoutAbbrev, v.City) {
-				matchingCities = append(matchingCities, v)
-			}
+	for idx := range candidateSet {
+		v := g.Cities[idx]
+		if strings.EqualFold(n, v.City) || strings.EqualFold(nWithoutAbbrev, v.City) {
+			matchingCities = append(matchingCities, v)
 		}
 	}
 
@@ -881,83 +880,128 @@ func (g *GeoBed) exactMatchCity(n string) GeobedCity {
 
 func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 	nCo, nSt, abbrevSlice, nSlice := g.extractLocationPieces(n)
-	ranges := g.getSearchRange(nSlice)
 
-	bestMatchingKeys := map[int]int{}
-	bestMatchingKey := 0
+	// Collect candidates from inverted index
+	candidateSet := make(map[int]bool)
 
-	for _, rng := range ranges {
-		for i, v := range g.Cities[rng.f:rng.t] {
-			currentKey := rng.f + i // Correct index into g.Cities
-			vCountry := v.Country()
-			vRegion := v.Region()
+	// Look up full original query
+	if indices, ok := g.nameIndex[toLower(n)]; ok {
+		for _, idx := range indices {
+			candidateSet[idx] = true
+		}
+	}
 
-			// Fast path for simple "City, ST" format
-			if nSt != "" {
-				if strings.EqualFold(n, v.City) && strings.EqualFold(nSt, vRegion) {
-					return v
-				}
+	// Look up cleaned query (after country/state extraction)
+	cleanedQuery := strings.Join(nSlice, " ")
+	if cleanedQuery != n {
+		if indices, ok := g.nameIndex[toLower(cleanedQuery)]; ok {
+			for _, idx := range indices {
+				candidateSet[idx] = true
 			}
+		}
+	}
 
-			for _, av := range abbrevSlice {
-				lowerAv := toLower(av)
-				if len(av) == 2 && strings.EqualFold(vRegion, lowerAv) {
-					bestMatchingKeys[currentKey] += 5
-				}
-				if len(av) == 2 && strings.EqualFold(vCountry, lowerAv) {
-					bestMatchingKeys[currentKey] += 3
-				}
+	// Look up each name slice part
+	for _, ns := range nSlice {
+		ns = strings.TrimSuffix(ns, ",")
+		key := toLower(ns)
+		if indices, ok := g.nameIndex[key]; ok {
+			for _, idx := range indices {
+				candidateSet[idx] = true
 			}
+		}
+	}
 
-			if nCo != "" && nCo == vCountry {
-				bestMatchingKeys[currentKey] += 4
-			}
-
-			if nSt != "" && nSt == vRegion {
-				bestMatchingKeys[currentKey] += 4
-			}
-
-			if v.CityAlt != "" {
-				alts := strings.Fields(v.CityAlt)
-				for _, altV := range alts {
-					if strings.EqualFold(altV, n) {
-						bestMatchingKeys[currentKey] += 3
-					}
-					if altV == n {
-						bestMatchingKeys[currentKey] += 5
-					}
-				}
-			}
-
-			// Exact match gets highest bonus
-			if strings.EqualFold(n, v.City) {
-				bestMatchingKeys[currentKey] += 7
-			} else if opts.FuzzyDistance > 0 {
-				// Fuzzy matching with Levenshtein distance
-				for _, ns := range nSlice {
-					ns = strings.TrimSuffix(ns, ",")
-					if len(ns) > 2 && fuzzyMatch(ns, v.City, opts.FuzzyDistance) {
-						// Fuzzy match gets slightly lower bonus than exact match
-						bestMatchingKeys[currentKey] += 5
-					}
-				}
-			}
-
+	// If fuzzy matching enabled, scan nameIndex keys for close matches
+	if opts.FuzzyDistance > 0 {
+		for key, indices := range g.nameIndex {
 			for _, ns := range nSlice {
 				ns = strings.TrimSuffix(ns, ",")
-				if strings.Contains(toLower(v.City), toLower(ns)) {
-					bestMatchingKeys[currentKey] += 2
+				if len(ns) > 2 && fuzzyMatch(ns, key, opts.FuzzyDistance) {
+					for _, idx := range indices {
+						candidateSet[idx] = true
+					}
 				}
-				if strings.EqualFold(v.City, ns) {
-					bestMatchingKeys[currentKey] += 1
+			}
+		}
+	}
+
+	bestMatchingKeys := map[int]int{}
+	bestMatchingKey := -1
+
+	for currentKey := range candidateSet {
+		v := g.Cities[currentKey]
+		vCountry := v.Country()
+		vRegion := v.Region()
+
+		// Fast path for simple "City, ST" format
+		if nSt != "" {
+			if strings.EqualFold(n, v.City) && strings.EqualFold(nSt, vRegion) {
+				return v
+			}
+		}
+
+		for _, av := range abbrevSlice {
+			lowerAv := toLower(av)
+			if len(av) == 2 && strings.EqualFold(vRegion, lowerAv) {
+				bestMatchingKeys[currentKey] += 5
+			}
+			if len(av) == 2 && strings.EqualFold(vCountry, lowerAv) {
+				bestMatchingKeys[currentKey] += 3
+			}
+		}
+
+		if nCo != "" && nCo == vCountry {
+			bestMatchingKeys[currentKey] += 4
+		}
+
+		if nSt != "" && nSt == vRegion {
+			bestMatchingKeys[currentKey] += 4
+		}
+
+		// Alt name matching — split on commas, not whitespace
+		if v.CityAlt != "" {
+			for _, raw := range strings.Split(v.CityAlt, ",") {
+				altV := strings.TrimSpace(raw)
+				if altV == "" {
+					continue
 				}
+				if strings.EqualFold(altV, n) {
+					bestMatchingKeys[currentKey] += 3
+				}
+				if altV == n {
+					bestMatchingKeys[currentKey] += 5
+				}
+			}
+		}
+
+		// Exact match gets highest bonus
+		if strings.EqualFold(n, v.City) {
+			bestMatchingKeys[currentKey] += 7
+		} else if opts.FuzzyDistance > 0 {
+			// Fuzzy matching with Levenshtein distance
+			for _, ns := range nSlice {
+				ns = strings.TrimSuffix(ns, ",")
+				if len(ns) > 2 && fuzzyMatch(ns, v.City, opts.FuzzyDistance) {
+					bestMatchingKeys[currentKey] += 5
+				}
+			}
+		}
+
+		for _, ns := range nSlice {
+			ns = strings.TrimSuffix(ns, ",")
+			if strings.Contains(toLower(v.City), toLower(ns)) {
+				bestMatchingKeys[currentKey] += 2
+			}
+			if strings.EqualFold(v.City, ns) {
+				bestMatchingKeys[currentKey] += 1
 			}
 		}
 	}
 
 	if nCo == "" {
 		hp := int32(0)
-		hpk := 0
+		hpk := -1
 		for k, v := range bestMatchingKeys {
 			if g.Cities[k].Population >= 1000 {
 				bestMatchingKeys[k] = v + 1
@@ -967,7 +1011,7 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 				hp = g.Cities[k].Population
 			}
 		}
-		if g.Cities[hpk].Population > 0 {
+		if hpk >= 0 && g.Cities[hpk].Population > 0 {
 			bestMatchingKeys[hpk]++
 		}
 	}
@@ -978,9 +1022,14 @@ func (g *GeoBed) fuzzyMatchLocation(n string, opts GeocodeOptions) GeobedCity {
 			m = v
 			bestMatchingKey = k
 		}
-		if v == m && g.Cities[k].Population > g.Cities[bestMatchingKey].Population {
+		if v == m && bestMatchingKey >= 0 && g.Cities[k].Population > g.Cities[bestMatchingKey].Population {
 			bestMatchingKey = k
 		}
+	}
+
+	// No match found — return empty city instead of cities[0]
+	if bestMatchingKey < 0 {
+		return GeobedCity{}
 	}
 
 	return g.Cities[bestMatchingKey]
@@ -1124,45 +1173,19 @@ func (g *GeoBed) extractLocationPieces(n string) (string, string, []string, []st
 	return nCo, nSt, abbrevSlice, nSlice
 }
 
-func (g *GeoBed) getSearchRange(nSlice []string) []r {
-	ranges := []r{}
-	for _, ns := range nSlice {
-		ns = strings.TrimSuffix(ns, ",")
-		if len(ns) > 0 {
-			fc := strings.ToLower(string([]rune(ns)[0]))
-			pik := string(prev([]rune(fc)[0]))
+// maxReverseGeocodeDistance is ~100km in radians on the unit sphere.
+// Reverse geocode returns empty result when closest city exceeds this distance.
+const maxReverseGeocodeDistance = 0.0157
 
-			// cityNameIdx stores the LAST index of cities starting with each letter.
-			// Go slices are half-open [start:end), so we need to:
-			// 1. Start at (previous letter's last index + 1) = first city of current letter
-			// 2. End at (current letter's last index + 1) to include the last city
+// nearbyThreshold is ~10km in radians on the unit sphere.
+// Used for the neighborhood override: if the closest match is a small city,
+// check whether a much larger city exists within this distance.
+const nearbyThreshold = 0.00157
 
-			fk := 0
-			if val, ok := g.cityNameIdx[pik]; ok {
-				fk = val + 1 // Start after the last city of previous letter
-			}
-
-			tk := len(g.Cities) // Default to end of slice
-			if val, ok := g.cityNameIdx[fc]; ok {
-				tk = val + 1 // Include the last city of current letter (half-open interval)
-			}
-
-			// Ensure bounds are valid
-			if fk > tk {
-				fk = tk
-			}
-			if tk > len(g.Cities) {
-				tk = len(g.Cities)
-			}
-
-			ranges = append(ranges, r{fk, tk})
-		}
-	}
-	return ranges
-}
-
-func prev(r rune) rune {
-	return r - 1
+// reverseCandidate pairs a city with its distance from the query point.
+type reverseCandidate struct {
+	city GeobedCity
+	dist float64
 }
 
 // ReverseGeocode converts lat/lng coordinates to a city location.
@@ -1170,8 +1193,7 @@ func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
 	queryLL := s2.LatLngFromDegrees(lat, lng)
 	queryCell := s2.CellIDFromLatLng(queryLL).Parent(s2CellLevel)
 
-	var closest GeobedCity
-	minDist := math.MaxFloat64
+	var candidates []reverseCandidate
 
 	for _, cell := range g.cellAndNeighbors(queryCell) {
 		indices, ok := g.cellIndex[cell]
@@ -1183,16 +1205,44 @@ func (g *GeoBed) ReverseGeocode(lat, lng float64) GeobedCity {
 			city := g.Cities[idx]
 			cityLL := s2.LatLngFromDegrees(float64(city.Latitude), float64(city.Longitude))
 			dist := float64(queryLL.Distance(cityLL))
+			candidates = append(candidates, reverseCandidate{city: city, dist: dist})
+		}
+	}
 
-			if dist < minDist {
-				minDist = dist
-				closest = city
-			} else if dist == minDist && city.Population > closest.Population {
-				closest = city
+	if len(candidates) == 0 {
+		return GeobedCity{}
+	}
+
+	// Sort by distance, then by population (descending) as tiebreaker
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].dist != candidates[j].dist {
+			return candidates[i].dist < candidates[j].dist
+		}
+		return candidates[i].city.Population > candidates[j].city.Population
+	})
+
+	best := candidates[0]
+
+	// Max distance cutoff — return empty for remote coordinates
+	if best.dist > maxReverseGeocodeDistance {
+		return GeobedCity{}
+	}
+
+	// Neighborhood override: if closest is a small city (<500K pop),
+	// prefer a nearby city within ~10km that has 10x+ the population.
+	if best.city.Population < 500_000 {
+		for _, c := range candidates[1:] {
+			if c.dist > nearbyThreshold {
+				break
+			}
+			if c.city.Population > best.city.Population*10 {
+				best = c
+				break
 			}
 		}
 	}
-	return closest
+
+	return best.city
 }
 
 // toLower converts a string to lowercase using the standard library.
@@ -1383,10 +1433,10 @@ func (g *GeoBed) store() error {
 	}
 
 	b.Reset()
-	if err := enc.Encode(g.cityNameIdx); err != nil {
+	if err := enc.Encode(g.nameIndex); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(cacheDir, "cityNameIdx.dmp"), b.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(cacheDir, "nameIndex.dmp"), b.Bytes(), 0644); err != nil {
 		return err
 	}
 
@@ -1463,14 +1513,14 @@ func loadGeobedCountryData() ([]CountryInfo, error) {
 	return co, nil
 }
 
-func loadGeobedCityNameIdx() (map[string]int, error) {
-	fh, cleanup, err := openOptionallyBzippedFile("geobed-cache/cityNameIdx.dmp")
+func loadNameIndex() (map[string][]int, error) {
+	fh, cleanup, err := openOptionallyBzippedFile("geobed-cache/nameIndex.dmp")
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
 
-	idx := make(map[string]int)
+	idx := make(map[string][]int)
 	dec := gob.NewDecoder(fh)
 	if err := dec.Decode(&idx); err != nil {
 		return nil, err

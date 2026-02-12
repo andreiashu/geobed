@@ -31,10 +31,10 @@ func (s *GeobedSuite) TestANewGeobed(c *C) {
 	c.Assert(g, Not(IsNil))
 	c.Assert(len(g.Cities), Not(Equals), 0)
 	c.Assert(len(g.Countries), Not(Equals), 0)
-	c.Assert(len(g.cityNameIdx), Not(Equals), 0)
+	c.Assert(len(g.nameIndex), Not(Equals), 0)
 	c.Assert(g.Cities, FitsTypeOf, []GeobedCity(nil))
 	c.Assert(g.Countries, FitsTypeOf, []CountryInfo(nil))
-	c.Assert(g.cityNameIdx, FitsTypeOf, make(map[string]int))
+	c.Assert(g.nameIndex, FitsTypeOf, make(map[string][]int))
 }
 
 func (s *GeobedSuite) TestGeocode(c *C) {
@@ -73,13 +73,10 @@ func (s *GeobedSuite) TestReverseGeocode(c *C) {
 	r = g.ReverseGeocode(37.4275, -122.1697)
 	c.Assert(r.City, Equals, "Stanford")
 
+	// With neighborhood override, nearby major city London (pop >1M) is preferred
+	// over the small "City of London" financial district (pop ~8k)
 	r = g.ReverseGeocode(51.51279, -0.09184)
-	c.Assert(r.City, Equals, "City of London")
-}
-
-func (s *GeobedSuite) TestNext(c *C) {
-	c.Assert(string(prev(rune("new york"[0]))), Equals, "m")
-	c.Assert(prev(rune("new york"[0])), Equals, int32(109))
+	c.Assert(r.City, Equals, "London")
 }
 
 func (s *GeobedSuite) TestToUpper(c *C) {
